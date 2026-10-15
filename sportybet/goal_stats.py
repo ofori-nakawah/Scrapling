@@ -28,6 +28,12 @@ def token(games):
         pass
     # Only a pre-match page with real (Sportradar-mapped) ids carries a Stats tab.
     ids = [g["event_id"] for g in games if g["status"] == "upcoming" and len(g["event_id"]) < 20]
+    if not ids:
+        # On-demand runs bring live games only: take pre-match games 40+ minutes out from the feed.
+        from scrape_today import pages
+        soon = (time.time() + 40 * 60) * 1000
+        ids = [ev["eventId"] for data in pages() for t in data.get("tournaments", []) for ev in t.get("events", [])
+               if ev.get("status") == 0 and ev.get("estimateStartTime", 0) > soon and len(ev["eventId"]) < 20][:4]
     t = mint(ids); json.dump(t, open(TOKEN_FILE, "w"))
     return t["token"]
 
@@ -153,8 +159,21 @@ def one(g):
     return row
 
 
+def on_demand(src, dst):
+    """Stats for a few games the day's pull missed (live_monitor calls this): games JSON in, rows out."""
+    global TOKEN
+    games = json.load(open(src))
+    TOKEN = token(games)
+    with ThreadPoolExecutor(8) as ex:
+        rows = list(ex.map(one, games))
+    json.dump(rows, open(dst, "w"), indent=1, ensure_ascii=False)
+    print(f"on demand: {sum(1 for r in rows if r['stats'])}/{len(rows)} games have stats")
+
+
 def main():
     global TOKEN
+    if sys.argv[1:2] == ["--events"]:
+        return on_demand(sys.argv[2], sys.argv[3])
     day = sys.argv[1] if len(sys.argv) > 1 else str(dt.datetime.now(dt.timezone.utc).date())
     games = json.load(open(os.path.join(HERE, "out", f"games-{day}.json")))
     TOKEN = token(games)

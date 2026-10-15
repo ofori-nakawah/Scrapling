@@ -20,6 +20,9 @@ A game with no supported call gets none, and the live routine never bets it.
 import datetime as dt, json, math, os, sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import markets_model  # noqa: E402
+
 HERE = Path(__file__).resolve().parent
 FAV_MAX_ODDS = float(os.environ.get("FAV_MAX_ODDS", "2.20"))
 DC_MAX_ODDS = float(os.environ.get("DC_MAX_ODDS", "2.60"))
@@ -90,7 +93,9 @@ def main():
     for g in games:
         picks, why = calls(g)
         win = next((p for p in picks if p["kind"] == "win"), None)  # the full-match winner call
-        out[g["event_id"]] = {"match": f"{g['home_team']} v {g['away_team']}", "kickoff_utc": g["kickoff_utc"],
+        model = markets_model.rates(g["stats"]) if g.get("stats") else None
+        out[g["event_id"]] = {"model": {"lh": model[0], "la": model[1]} if model else None,
+                              "match": f"{g['home_team']} v {g['away_team']}", "kickoff_utc": g["kickoff_utc"],
                               "home": g["home_team"], "away": g["away_team"], "picks": picks,
                               "side": win["side"] if win else None, "team": win["name"][:-4] if win else None,
                               "why": why}

@@ -45,6 +45,10 @@ MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "3"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
+PRED_MIN = int(os.environ.get("PRED_MIN", "70"))   # pre-match chance (%) an outcome needs
+
+sys.path.insert(0, str(HERE))
+import markets_model  # noqa: E402
 
 sys.path.insert(0, str(BOT / "scripts"))
 
@@ -89,16 +93,31 @@ def read(path, default):
 
 # ---- the morning analysis ----------------------------------------------------------------
 
+REFRESH_HOURS = float(os.environ.get("REFRESH_HOURS", "3"))
+
+
 def ensure_predictions(day):
-    """Pull the day's games, stats and calls once; predictions-<day>.json marks it done."""
-    if (HERE / "out" / f"predictions-{day}.json").exists():
+    """Pull the day's games, stats and calls; predictions-<day>.json marks it done. Every REFRESH_HOURS
+    the pull runs again for games SportyBet listed since (one was missing at 17:33 on 2026-10-15 and
+    played that evening): new games get calls, games already analysed keep theirs, so a game in
+    progress never has its calls changed."""
+    path = HERE / "out" / f"predictions-{day}.json"
+    first = not path.exists()
+    if not first and time.time() - path.stat().st_mtime < REFRESH_HOURS * 3600:
         return
-    log(f"morning analysis for {day}")
+    before = read(path, {})
+    log(f"{'morning analysis' if first else 'refresh'} for {day}")
     container("scrape_today.py", str(day), timeout=600)
     container("goal_stats.py", str(day), timeout=1800)
     r = subprocess.run([sys.executable, str(HERE / "predict_day.py"), str(day)], capture_output=True, text=True)
     log(r.stdout.strip().splitlines()[0] if r.stdout.strip() else r.stderr[-300:])
-    called = [v for v in read(HERE / "out" / f"predictions-{day}.json", {}).values() if v.get("picks")]
+    merged = {**read(path, {}), **before}             # earlier calls win
+    path.write_text(json.dumps(merged, indent=1, ensure_ascii=False))
+    if not first:
+        added = [v for k, v in merged.items() if k not in before and v.get("picks")]
+        log(f"refresh: {len(merged) - len(before)} new games, {len(added)} with calls")
+        return
+    called = [v for v in merged.values() if v.get("picks")]
     telegram(f"📋 {day}: {len(called)} games with morning calls. Staking GHS {STAKE:.0f} when a call is "
              f"{MIN_CUSHION}+ goals from losing at {MIN_MINUTE_1H}'+ (1st half) or {MIN_MINUTE}'+ at {MAX_ODDS:.2f} or less." if AUTO_STAKE else
              f"📋 {day}: {len(called)} games with morning calls (alerts only).", "morning")
@@ -106,11 +125,52 @@ def ensure_predictions(day):
 
 
 def predictions():
-    """Today's and yesterday's calls: a game after midnight UTC kicked off on the previous day."""
+    """Today's and yesterday's calls: a game after midnight UTC kicked off on the previous day.
+    On-demand analyses fill in games the day's pull never saw."""
     preds = {}
     for d in (today() - dt.timedelta(days=1), today()):
+        for k, v in read(HERE / "out" / f"predictions-ondemand-{d}.json", {}).items():
+            preds.setdefault(k, v)
         preds.update(read(HERE / "out" / f"predictions-{d}.json", {}))
     return preds
+
+
+ANALYSE_1H, ANALYSE_2H = 30, 75     # 5 minutes before the 35' and 80' windows
+
+
+def analyse_missing(snap, preds):
+    """Run the analysis now for live games with none that are within 5 minutes of a window (or already
+    in one), so no game reaches its window unanalysed. Live games have no pre-match price, so these get
+    the stats calls (match under, team under, first half under) but not the winner / or-draw calls.
+    A game is analysed once; one with no stats is recorded as such and not retried."""
+    due = [g for g in snap["games"] if g["event"] not in preds and g["minute"] is not None
+           and ((g["period"] == "H1" and g["minute"] >= ANALYSE_1H) or g["period"] == "HT"
+                or (g["period"] == "H2" and g["minute"] >= ANALYSE_2H))]
+    if not due:
+        return preds
+    import predict_day
+    games = [{"event_id": g["event"], "home_team": g["home"], "away_team": g["away"], "status": "live",
+              "kickoff_utc": "", "league": g["league"]} for g in due]
+    (OUT / "ondemand-in.json").write_text(json.dumps(games))
+    log(f"on-demand analysis: {', '.join(g['home'] + ' v ' + g['away'] for g in due)}")
+    try:
+        container("goal_stats.py", "--events", "/work/out/live/ondemand-in.json", "/work/out/live/ondemand-out.json", timeout=600)
+        rows = read(OUT / "ondemand-out.json", [])
+    except Exception as e:  # noqa: BLE001
+        log("on-demand analysis failed:", e)
+        return preds                     # not recorded: tried again next pass
+    path = HERE / "out" / f"predictions-ondemand-{today()}.json"
+    store = read(path, {})
+    for r in rows:
+        picks, why = predict_day.calls(r)
+        model = markets_model.rates(r["stats"]) if r.get("stats") else None
+        store[r["event_id"]] = {"model": {"lh": model[0], "la": model[1]} if model else None,
+                                "match": f"{r['home_team']} v {r['away_team']}", "kickoff_utc": "", "home": r["home_team"],
+                                "away": r["away_team"], "picks": picks, "side": None, "team": None,
+                                "why": why or "on-demand (live: no winner calls)", "on_demand": True}
+        log(f"  {r['home_team']} v {r['away_team']}: " + ("; ".join(p["name"] for p in picks) or f"no calls ({why})"))
+    path.write_text(json.dumps(store, indent=1, ensure_ascii=False))
+    return predictions()
 
 
 # ---- matching -------------------------------------------------------------------------------
@@ -155,32 +215,65 @@ def window(g):
     return None
 
 
+_sims = {}       # event -> simulated matches from its model (built once per process)
+_probs = {}      # (event, market, specifier, outcome) -> pre-match chance
+
+
+def chance(event, model, o):
+    key = (event, o[0], o[1], o[2])
+    if key not in _probs:
+        r = markets_model.rule(o[0], o[1], o[4], o[3])
+        if event not in _sims:
+            _sims[event] = markets_model.simulate(model["lh"], model["la"])
+        _probs[key] = markets_model.prob(r[0], _sims[event]) if r else None
+    return _probs[key]
+
+
 def matches(snap, preds, staked):
-    """Live games where a morning call is MIN_CUSHION+ goals from losing, priced MAX_ODDS or less:
-    first-half calls at MIN_MINUTE_1H+ in the first half, full-match calls at MIN_MINUTE+ in the second.
-    One leg per game per half: every candidate already survives one late goal, so the best price
-    wins, then the bigger cushion."""
+    """Every open outcome on every analysed live game, on any market goals settle (markets_model):
+    it qualifies at MAX_ODDS or less when MIN_CUSHION+ further goals would be needed to lose it and
+    the game's analysis gave it PRED_MIN%+ before kick-off. First-half markets in the first-half
+    window, full-match markets in the second-half window. One leg per game per half: the best price,
+    then the bigger cushion."""
     out = []
     for g in snap["games"]:
         p = preds.get(g["event"])
         half = window(g)
-        if not p or not p.get("picks") or not half or f"{g['event']}|{half}" in staked:
+        if not p or not p.get("model") or not half or f"{g['event']}|{half}" in staked:
             continue
         try:
             h, a = map(int, g["score"].split(":"))
         except (AttributeError, ValueError):
             continue
+        halves = list(g.get("halves") or [])
+        if half == "1H":
+            halves, now = [halves[0] if halves else (h, a)], 1
+        else:
+            if len(halves) < 2:   # no per-half split: count every goal as first half, the order test still runs
+                halves = [(h, a), (0, 0)]
+            halves, now = halves[:2], 2
         ok = []
-        calls = p["picks"] + handicaps(p["picks"])
-        for c in [c for c in calls if (c.get("half") == "1H") == (half == "1H")]:
-            price = g.get("prices", {}).get(c["leg"])
-            need = cushion(c, h, a)
-            if price is not None and price <= MAX_ODDS and need >= MIN_CUSHION:
-                ok.append((need, price, c))
+        for o in g.get("outcomes") or []:
+            mid, spec, oid, mdesc, odesc, price = o
+            if price > MAX_ODDS:
+                continue
+            r = markets_model.rule(mid, spec, odesc, mdesc)
+            if not r or r[1] != half:
+                continue
+            need = markets_model.cushion(r[0], halves, now)
+            if need < MIN_CUSHION:
+                continue
+            pc = chance(g["event"], p["model"], o)
+            if pc is None or pc * 100 < PRED_MIN:
+                continue
+            ok.append((price, need, pc, o))
         if ok:
-            need, price, c = max(ok, key=lambda x: (x[1], x[0]))
-            out.append({**g, "half": half, "pick": {"name": c["name"], "price": price, "leg": f"{g['event']}/" + c["leg"].replace("|", "/"),
-                                      "cushion": need}, "team": c["name"]})
+            price, need, pc, o = max(ok, key=lambda x: (x[0], x[1]))
+            mid, spec, oid, mdesc, odesc, _ = o
+            name = f"{mdesc}: {odesc}" if mdesc else odesc
+            out.append({**g, "half": half, "team": name,
+                        "pick": {"name": name, "price": price, "cushion": need, "pre_match": round(pc * 100),
+                                 "leg": f"{g['event']}/{mid}/{spec}/{oid}"}})
     return out
 
 
@@ -262,7 +355,7 @@ def stake(group, tickets):
     for g in group:
         odds *= g["pick"]["price"]
     desc = "; ".join(f"{g['minute']}' {g['home']} {g['score']} {g['away']} → {g['pick']['name']} @ {g['pick']['price']:.2f}"
-                     f" ({g['pick']['cushion']} goals to lose)" for g in group)
+                     f" ({g['pick']['cushion']} goals to lose, {g['pick']['pre_match']}% pre-match)" for g in group)
     code = container("book_live.py", *legs, timeout=120)
     # The cushion was counted from the score at scan time. A goal since then can leave a leg one goal
     # from losing, so re-read every leg's score through the booked code and stake only if none moved.
@@ -354,6 +447,7 @@ def once():
         log("morning analysis failed:", e)
     preds = predictions()
     snap = json.loads(container("live_scan.py"))
+    preds = analyse_missing(snap, preds)
     (OUT / "latest.json").write_text(json.dumps(snap, indent=1))
     with open(OUT / f"{day}.jsonl", "a") as f:
         f.write(json.dumps(snap) + "\n")
