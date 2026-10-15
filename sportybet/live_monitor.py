@@ -33,7 +33,10 @@ OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
 STAKE = float(os.environ.get("STAKE", "5"))
-MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.04"))
+MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.05"))
+# Shadow log (the user, 2026-10-15): bets passing every rule but priced above MAX_ODDS, up to SHADOW_MAX,
+# are booked (free, never staked) and their real result recorded, to set the cap from data.
+SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.20"))
 MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "80"))          # full-match calls, second half
 MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
@@ -45,7 +48,7 @@ MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "3"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
-PRED_MIN = int(os.environ.get("PRED_MIN", "70"))   # pre-match chance (%) an outcome needs
+PRED_MIN = int(os.environ.get("PRED_MIN", "80"))   # pre-match chance (%) an outcome needs (the user: 80, 2026-10-15)
 
 sys.path.insert(0, str(HERE))
 import markets_model  # noqa: E402
@@ -229,6 +232,9 @@ def chance(event, model, o):
     return _probs[key]
 
 
+SHADOWS = []     # filled by matches(): candidates priced above the cap, for the shadow log
+
+
 def matches(snap, preds, staked):
     """Every open outcome on every analysed live game, on any market goals settle (markets_model):
     it qualifies at MAX_ODDS or less when MIN_CUSHION+ further goals would be needed to lose it and
@@ -255,7 +261,7 @@ def matches(snap, preds, staked):
         ok = []
         for o in g.get("outcomes") or []:
             mid, spec, oid, mdesc, odesc, price = o
-            if price > MAX_ODDS:
+            if price > SHADOW_MAX:
                 continue
             r = markets_model.rule(mid, spec, odesc, mdesc)
             if not r or r[1] != half:
@@ -265,6 +271,11 @@ def matches(snap, preds, staked):
                 continue
             pc = chance(g["event"], p["model"], o)
             if pc is None or pc * 100 < PRED_MIN:
+                continue
+            if price > MAX_ODDS:
+                SHADOWS.append({"event": g["event"], "half": half, "minute": g["minute"], "score": g["score"],
+                                "match": f"{g['home']} v {g['away']}", "name": f"{mdesc}: {odesc}", "price": price,
+                                "cushion": need, "pre_match": round(pc * 100), "leg": f"{g['event']}/{mid}/{spec}/{oid}"})
                 continue
             ok.append((price, need, pc, o))
         if ok:
@@ -395,6 +406,65 @@ def stake(group, tickets):
     return t
 
 
+# ---- shadow log -------------------------------------------------------------------------------
+
+def shadow_file(day):
+    return OUT / f"shadow-{day}.json"
+
+
+def shadow_record(day):
+    """Book each new shadow candidate once (its own single code) and keep it for settling."""
+    if not SHADOWS:
+        return
+    rows = read(shadow_file(day), [])
+    seen = {(r["leg"]) for d in (day - dt.timedelta(days=1), day) for r in read(shadow_file(d), [])}
+    for c in SHADOWS:
+        if c["leg"] in seen:
+            continue
+        seen.add(c["leg"])
+        try:
+            c["code"] = container("book_live.py", c["leg"], timeout=120)
+        except Exception as e:  # noqa: BLE001
+            log("shadow booking failed:", e)
+            continue
+        c["at"] = dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
+        c["result"] = None
+        rows.append(c)
+        log(f"shadow: {c['match']} {c['minute']}' {c['score']} → {c['name']} @ {c['price']:.2f} "
+            f"({c['cushion']} to lose, {c['pre_match']}%) code {c['code']}")
+    shadow_file(day).write_text(json.dumps(rows, indent=1))
+
+
+def shadow_settle(day):
+    """Read results for shadow legs whose games have ended (every 5 minutes, one container run)."""
+    mark = OUT / "shadow_checked"
+    try:
+        if time.time() - mark.stat().st_mtime < 300:
+            return
+    except OSError:
+        pass
+    mark.touch()
+    for d in (day - dt.timedelta(days=1), day):
+        rows = read(shadow_file(d), [])
+        open_ = [r for r in rows if r.get("result") is None and r.get("code")]
+        if not open_:
+            continue
+        try:
+            st = json.loads(container("book_live.py", "--status-many", *[r["code"] for r in open_], timeout=300))
+        except Exception as e:  # noqa: BLE001
+            log("shadow settle failed:", e)
+            continue
+        for r in open_:
+            legs = st.get(r["code"])
+            if not isinstance(legs, list) or not legs:
+                continue
+            leg = legs[0]
+            if leg["status"] in (3, 4) and leg["winning"] in (0, 1):
+                r["result"] = "won" if leg["winning"] == 1 else "lost"
+                r["final"] = leg.get("score")
+        shadow_file(d).write_text(json.dumps(rows, indent=1))
+
+
 # ---- the page -------------------------------------------------------------------------------
 
 def page(snap, preds, tickets, note):
@@ -464,7 +534,13 @@ def once():
     staked = {k for d in (day - dt.timedelta(days=1), day) for t in read(tickets_file(d), [])
               if t.get("state") in ("placed", "unclear", "attempted")
               for k in (t.get("keys") or [f"{ev}|FT" for ev in t["events"]])}
+    SHADOWS.clear()
     group = matches(snap, preds, staked)
+    try:
+        shadow_record(day)
+        shadow_settle(day)
+    except Exception as e:  # noqa: BLE001
+        log("shadow log failed:", e)
     note = ""
     if group:
         names = ", ".join(f"{g['pick']['name']} ({g['home']} {g['score']} {g['away']}, {g['minute']}')" for g in group)

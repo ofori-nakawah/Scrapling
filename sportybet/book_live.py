@@ -38,5 +38,13 @@ def status(code):
 if __name__ == "__main__":
     if sys.argv[1:2] == ["--status"]:
         print(json.dumps(status(sys.argv[2])))
+    elif sys.argv[1:2] == ["--status-many"]:
+        out = {}
+        for code in sys.argv[2:]:
+            try:
+                out[code] = status(code)
+            except SystemExit as e:
+                out[code] = {"error": str(e)}
+        print(json.dumps(out))
     else:
         print(book(sys.argv[1:]))
