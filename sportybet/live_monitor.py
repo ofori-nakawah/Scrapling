@@ -33,10 +33,10 @@ OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
 STAKE = float(os.environ.get("STAKE", "5"))
-MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.05"))
+MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.20"))
 # Shadow log (the user, 2026-10-15): bets passing every rule but priced above MAX_ODDS, up to SHADOW_MAX,
 # are booked (free, never staked) and their real result recorded, to set the cap from data.
-SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.20"))
+SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.40"))
 MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "80"))          # full-match calls, second half
 MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
@@ -44,7 +44,7 @@ MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
 MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "0"))
 MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "5"))
 # At most this many slips open (placed, not yet settled) at once; the user's rule, 2026-10-15. 0 = no limit.
-MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "3"))
+MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "5"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
