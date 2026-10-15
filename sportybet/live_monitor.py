@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""Watch live football on SportyBet and stake the games that confirm the morning prediction.
+
+Every day (UTC) it first pulls the day's games, their stats and the predicted winners
+(scrape_today.py -> goal_stats.py -> predict_day.py). Then, every minute while games are live:
+
+  a game MATCHES when it is in the second half at MIN_MINUTE or later and one of its morning calls
+  (winner, winner or draw, match under, a team under — see predict_day.py) is MIN_CUSHION or more
+  goals from losing at the current score, priced MAX_ODDS or less. E.g. "Dortmund under 1.5 goals"
+  at 0 Dortmund goals in the 80th minute, at 1.04.
+
+All games matching at once go on one ticket, which is booked and staked (STAKE, GHS) through the
+bot's own betslip script, without asking. Each game is staked at most once. Refusals:
+  - stake outside config/risk.json stake_min..stake_max; balance below the stake;
+  - today's lost stakes reaching config/risk.json daily_loss_limit (one lost 5-cedi ticket at the
+    default limit of 5 ends the day);
+  - MAX_TICKETS_PER_DAY tickets already placed today;
+  - an unclear placement: staking halts (out/live/HALT) until a person checks Bet History and
+    deletes that file. Nothing is ever clicked twice.
+
+    python3 live_monitor.py            # forever (the launchd service runs this)
+    python3 live_monitor.py --once     # one pass
+
+Env: AUTO_STAKE (1 = stake, 0 = alert only), STAKE 5, MAX_ODDS 1.04, MIN_MINUTE 80, MIN_CUSHION 2,
+MAX_TICKETS_PER_DAY 4, INTERVAL 60, IDLE_INTERVAL 300.
+"""
+import datetime as dt, html, json, math, os, subprocess, sys, time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OUT = HERE / "out" / "live"
+BOT = Path("/Users/apple/Projects/claudesportybot")
+AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
+STAKE = float(os.environ.get("STAKE", "5"))
+MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.04"))
+MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "80"))
+MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
+MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "4"))
+INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
+DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
+HALT = OUT / "HALT"
+
+sys.path.insert(0, str(BOT / "scripts"))
+
+
+def log(*a):
+    print(dt.datetime.now(dt.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"), *a, flush=True)
+
+
+def today():
+    return dt.datetime.now(dt.timezone.utc).date()
+
+
+def container(script, *args, timeout=240):
+    r = subprocess.run(DOCKER + [f"/work/{script}", *args], capture_output=True, text=True, timeout=timeout)
+    line = next((l for l in reversed(r.stdout.splitlines()) if l.strip()), "")
+    if r.returncode != 0 or not line:
+        raise RuntimeError(f"{script} failed: {(r.stderr or r.stdout)[-300:]}")
+    return line
+
+
+# Which events reach Telegram (env NOTIFY, comma-separated): morning, matched, staked, won, lost, halt.
+# The user asked for wins only (2026-10-15); everything still goes to the log and the live page.
+NOTIFY = {k.strip() for k in os.environ.get("NOTIFY", "won").split(",") if k.strip()}
+
+
+def telegram(text, kind):
+    if kind not in NOTIFY:
+        return
+    try:
+        from telegram import send
+        send(text)
+    except Exception as e:  # noqa: BLE001
+        log("telegram failed:", e)
+
+
+def read(path, default):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return default
+
+
+# ---- the morning analysis ----------------------------------------------------------------
+
+def ensure_predictions(day):
+    """Pull the day's games, stats and calls once; predictions-<day>.json marks it done."""
+    if (HERE / "out" / f"predictions-{day}.json").exists():
+        return
+    log(f"morning analysis for {day}")
+    container("scrape_today.py", str(day), timeout=600)
+    container("goal_stats.py", str(day), timeout=1800)
+    r = subprocess.run([sys.executable, str(HERE / "predict_day.py"), str(day)], capture_output=True, text=True)
+    log(r.stdout.strip().splitlines()[0] if r.stdout.strip() else r.stderr[-300:])
+    called = [v for v in read(HERE / "out" / f"predictions-{day}.json", {}).values() if v.get("picks")]
+    telegram(f"📋 {day}: {len(called)} games with morning calls. Staking GHS {STAKE:.0f} when a call is "
+             f"{MIN_CUSHION}+ goals from losing at {MIN_MINUTE}'+ at {MAX_ODDS:.2f} or less." if AUTO_STAKE else
+             f"📋 {day}: {len(called)} games with morning calls (alerts only).", "morning")
+
+
+def predictions():
+    """Today's and yesterday's calls: a game after midnight UTC kicked off on the previous day."""
+    preds = {}
+    for d in (today() - dt.timedelta(days=1), today()):
+        preds.update(read(HERE / "out" / f"predictions-{d}.json", {}))
+    return preds
+
+
+# ---- matching -------------------------------------------------------------------------------
+
+def cushion(pick, h, a):
+    """Goals that would have to come, the wrong way, for this call to lose at the current score."""
+    side = {"home": h, "away": a}
+    if pick["kind"] in ("win", "dc", "hcp"):
+        lead = side[pick["side"]] - side["away" if pick["side"] == "home" else "home"]
+        if pick["kind"] != "win" and lead < 1:
+            return 0              # or-draw / handicap only ride a predicted side that is already ahead
+        return max(0, lead + {"win": 0, "dc": 1, "hcp": pick.get("k", 0)}[pick["kind"]])
+    if pick["kind"] == "total_under":
+        return max(0, math.floor(pick["line"]) - (h + a) + 1)
+    if pick["kind"] == "team_under":
+        return max(0, math.floor(pick["line"]) - side[pick["side"]] + 1)
+    return 0
+
+
+def handicaps(picks):
+    """For each predicted winner, the same side on SportyBet's handicap market (14) with a +1 and a +2
+    start: leading 1:0 with +1 reads 2:0, so one late goal (2:1) still wins."""
+    out = []
+    for c in picks:
+        if c["kind"] != "win":
+            continue
+        for k in (1, 2):
+            spec, outcome = (f"hcp={k}:0", "1711") if c["side"] == "home" else (f"hcp=0:{k}", "1713")
+            out.append({"name": f"{c['name'][:-4]} handicap +{k}", "kind": "hcp", "side": c["side"], "k": k,
+                        "leg": f"14|{spec}|{outcome}"})
+    return out
+
+
+def matches(snap, preds, staked):
+    """Live games where a morning call is MIN_CUSHION+ goals from losing at MIN_MINUTE+ (2nd half),
+    priced MAX_ODDS or less. One leg per game: every candidate already survives one late goal, so
+    the best price wins, then the bigger cushion."""
+    out = []
+    for g in snap["games"]:
+        p = preds.get(g["event"])
+        if not p or not p.get("picks") or g["event"] in staked:
+            continue
+        if g["period"] != "H2" or g["minute"] is None or g["minute"] < MIN_MINUTE:
+            continue
+        try:
+            h, a = map(int, g["score"].split(":"))
+        except (AttributeError, ValueError):
+            continue
+        ok = []
+        for c in p["picks"] + handicaps(p["picks"]):
+            price = g.get("prices", {}).get(c["leg"])
+            need = cushion(c, h, a)
+            if price is not None and price <= MAX_ODDS and need >= MIN_CUSHION:
+                ok.append((need, price, c))
+        if ok:
+            need, price, c = max(ok, key=lambda x: (x[1], x[0]))
+            out.append({**g, "pick": {"name": c["name"], "price": price, "leg": f"{g['event']}/" + c["leg"].replace("|", "/"),
+                                      "cushion": need}, "team": c["name"]})
+    return out
+
+
+# ---- guards ---------------------------------------------------------------------------------
+
+def tickets_file(day):
+    return OUT / f"tickets-{day}.json"
+
+
+def settle(tickets):
+    """Fill in won/lost for tickets whose games have ended (read from the booking code)."""
+    for t in tickets:
+        if t.get("result") or t.get("state") != "placed":
+            continue
+        try:
+            legs = json.loads(container("book_live.py", "--status", t["code"], timeout=120))
+        except Exception as e:  # noqa: BLE001
+            log("status failed:", t["code"], e)
+            continue
+        ended = [l for l in legs if l["status"] in (3, 4)]
+        if any(l["winning"] == 0 for l in ended):
+            t["result"] = "lost"
+        elif len(ended) == len(legs) and all(l["winning"] == 1 for l in legs):
+            t["result"] = "won"
+        if t.get("result"):
+            telegram(f"{'✅' if t['result'] == 'won' else '❌'} Ticket {t['code']} {t['result'].upper()} "
+                     f"(GHS {t['stake']:.2f} @ {t['odds']:.2f})", t["result"])
+    return tickets
+
+
+def refusal(tickets):
+    import risk
+    cfg = risk.load_config()
+    if HALT.exists():
+        return f"halted: {HALT.read_text().strip()} (check Bet History, then delete {HALT})"
+    if not cfg["stake_min"] <= STAKE <= cfg["stake_max"]:
+        return f"stake GHS {STAKE} outside config/risk.json {cfg['stake_min']}-{cfg['stake_max']}"
+    placed = [t for t in tickets if t.get("state") == "placed"]
+    if len(placed) >= MAX_TICKETS:
+        return f"{len(placed)} tickets already today (MAX_TICKETS_PER_DAY {MAX_TICKETS})"
+    lost = sum(t["stake"] for t in placed if t.get("result") == "lost")
+    if cfg.get("daily_loss_limit") and lost >= cfg["daily_loss_limit"]:
+        return f"daily loss limit: lost GHS {lost:.2f} today (limit {cfg['daily_loss_limit']})"
+    bal = risk.balance_now()
+    if bal is None:
+        return "balance unreadable (session expired? run `npm run login` in claudesportybot)"
+    if bal < STAKE:
+        return f"balance GHS {bal:.2f} below the GHS {STAKE:.2f} stake"
+    return None
+
+
+# ---- staking --------------------------------------------------------------------------------
+
+def stake(group, tickets):
+    legs = [g["pick"]["leg"] for g in group]
+    odds = 1.0
+    for g in group:
+        odds *= g["pick"]["price"]
+    desc = "; ".join(f"{g['minute']}' {g['home']} {g['score']} {g['away']} → {g['pick']['name']} @ {g['pick']['price']:.2f}"
+                     f" ({g['pick']['cushion']} goals to lose)" for g in group)
+    code = container("book_live.py", *legs, timeout=120)
+    # The cushion was counted from the score at scan time. A goal since then can leave a leg one goal
+    # from losing, so re-read every leg's score through the booked code and stake only if none moved.
+    now = {l["event"]: l["score"] for l in json.loads(container("book_live.py", "--status", code, timeout=120))}
+    moved = [g for g in group if now.get(g["event"]) != g["score"]]
+    if moved:
+        log(f"{code}: not staked, score changed since the scan: " +
+            ", ".join(f"{g['home']} {g['score']}→{now.get(g['event'])}" for g in moved))
+        return None
+    t = {"code": code, "stake": STAKE, "odds": round(odds, 2), "events": [g["event"] for g in group],
+         "games": desc, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "state": "attempted"}
+    tickets.append(t)
+    tickets_file(today()).write_text(json.dumps(tickets, indent=1))   # recorded before any click
+    log(f"STAKING {code}: {desc}")
+    try:
+        r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--place", "--headless"],
+                           cwd=BOT, capture_output=True, text=True, timeout=420)
+        out, rc = r.stdout + r.stderr, r.returncode
+    except subprocess.TimeoutExpired as e:
+        out, rc = str(e), 3
+    with open(OUT / "stage.log", "a") as f:
+        f.write(f"\n==== {t['at']} {code} exit {rc}\n{out}\n")
+    if rc == 0:
+        t["state"] = "placed"
+        telegram(f"💰 Staked GHS {STAKE:.2f} on {code} (total {t['odds']:.2f}, returns ~GHS {STAKE * t['odds']:.2f})\n{desc}", "staked")
+    elif "Nothing was placed" in out:
+        t["state"] = "not_placed"
+        t["why"] = out.strip().splitlines()[-1][:200]
+        log("not placed:", t["why"])
+    else:
+        t["state"] = "unclear"
+        HALT.write_text(f"{t['at']} {code}: placement result unclear (stage exit {rc})")
+        telegram(f"⚠️ Ticket {code}: placement result UNCLEAR. Auto-staking is halted. Check Bet History, "
+                 f"then delete {HALT} to resume.\n{desc}", "halt")
+    tickets_file(today()).write_text(json.dumps(tickets, indent=1))
+    log(f"{code}: {t['state']}")
+    return t
+
+
+# ---- the page -------------------------------------------------------------------------------
+
+def page(snap, preds, tickets, note):
+    e = html.escape
+    rows = []
+    for g in sorted(snap["games"], key=lambda g: -(g["minute"] or 0)):
+        p = preds.get(g["event"]) or {}
+        try:
+            h, a = map(int, (g["score"] or "").split(":"))
+        except ValueError:
+            h = a = None
+        bits = []
+        for c in p.get("picks") or []:
+            pr = g.get("prices", {}).get(c["leg"])
+            need = cushion(c, h, a) if h is not None else None
+            hot = pr is not None and pr <= MAX_ODDS and need is not None and need >= MIN_CUSHION
+            bits.append(f"<span class='pk{' hot' if hot else ''}'>{e(c['name'])} <b>{pr:.2f}</b>" if pr else
+                        f"<span class=pk>{e(c['name'])} <small>closed</small>")
+            bits[-1] += f"<small> · {need} to lose</small></span>" if need is not None else "</span>"
+        call = " ".join(bits) or "<small>no call</small>"
+        price = ""
+        late = g["period"] == "H2" and (g["minute"] or 0) >= MIN_MINUTE
+        rows.append(f"<tr class='{'late' if late else ''}'><td>{g['minute'] if g['minute'] is not None else '–'}'</td>"
+                    f"<td class=sc>{e(g['score'] or '')}</td><td>{e(g['home'])}<br>{e(g['away'])}<br><small>{e(g['league'])}</small></td>"
+                    f"<td>{call}</td><td>{price}</td></tr>")
+    trows = "".join(f"<tr><td>{e(t['at'][11:16])}</td><td>{e(t['code'])}</td><td>{e(t['state'])}{(' · ' + e(t['result'])) if t.get('result') else ''}</td>"
+                    f"<td>{t['odds']:.2f}</td><td><small>{e(t['games'])}</small></td></tr>" for t in tickets) or "<tr><td colspan=5><small>none today</small></td></tr>"
+    at = dt.datetime.fromtimestamp(snap["at"], dt.timezone.utc).strftime("%H:%M:%S UTC")
+    (OUT / "index.html").write_text(f"""<!doctype html><meta charset=utf-8><meta http-equiv=refresh content=30>
+<meta name=viewport content="width=device-width,initial-scale=1"><title>Live games</title>
+<style>body{{font:14px system-ui;margin:16px;background:#fff;color:#111}}table{{border-collapse:collapse;width:100%;margin-bottom:20px}}
+td{{padding:6px;border-bottom:1px solid #e5e5e5;vertical-align:top}}.sc{{font-size:18px;font-weight:700}}tr.late{{background:#fff7e0}}
+small{{color:#777}}.note{{padding:8px 12px;background:#f4f4f4;border-radius:8px}}
+.pk{{display:inline-block;margin:0 6px 4px 0;padding:2px 8px;border-radius:12px;background:#f0f0f0}}.pk.hot{{background:#c8f0d0}}</style>
+<h2>Live football — {len(snap['games'])} games</h2>
+<p class=note>{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: a morning call {MIN_CUSHION}+ goals from losing at {MIN_MINUTE}'+ (2nd half), priced ≤ {MAX_ODDS:.2f} (green), GHS {STAKE:.0f}.
+{('<br><b>' + e(note) + '</b>') if note else ''}<br><small>Updated {at} · refreshes every 30 s</small></p>
+<h3>Today's tickets</h3><table>{trows}</table>
+<h3>Live</h3><table><tr><td></td><td></td><td></td><td><small>morning calls · live price · goals to lose</small></td><td></td></tr>{''.join(rows)}</table>""")
+
+
+# ---- the loop -------------------------------------------------------------------------------
+
+def once():
+    day = today()
+    OUT.mkdir(parents=True, exist_ok=True)
+    try:
+        ensure_predictions(day)
+    except Exception as e:  # noqa: BLE001
+        log("morning analysis failed:", e)
+    preds = predictions()
+    snap = json.loads(container("live_scan.py"))
+    (OUT / "latest.json").write_text(json.dumps(snap, indent=1))
+    with open(OUT / f"{day}.jsonl", "a") as f:
+        f.write(json.dumps(snap) + "\n")
+
+    tickets = settle(read(tickets_file(day), []))
+    tickets_file(day).write_text(json.dumps(tickets, indent=1))
+    staked = {ev for d in (day - dt.timedelta(days=1), day) for t in read(tickets_file(d), [])
+              if t.get("state") in ("placed", "unclear", "attempted") for ev in t["events"]}
+    group = matches(snap, preds, staked)
+    note = ""
+    if group:
+        names = ", ".join(f"{g['pick']['name']} ({g['home']} {g['score']} {g['away']}, {g['minute']}')" for g in group)
+        why = refusal(tickets) if AUTO_STAKE else "alerts only (AUTO_STAKE=0)"
+        if why:
+            note = f"Matched {names} — not staked: {why}"
+            log(note)
+            key = OUT / "refused.json"
+            seen = read(key, [])
+            new = [g["event"] for g in group if g["event"] not in seen]
+            if new:
+                telegram(f"🔎 Matched: {names}\nNot staked: {why}", "matched")
+                key.write_text(json.dumps(seen + new))
+        else:
+            stake(group, tickets)
+    page(snap, preds, tickets, note)
+    late = sum(1 for g in snap["games"] if (g["minute"] or 0) >= MIN_MINUTE)
+    with_call = sum(1 for g in snap["games"] if (preds.get(g["event"]) or {}).get("picks"))
+    log(f"{len(snap['games'])} live, {with_call} with a morning call, {late} at {MIN_MINUTE}'+, {len(group)} matching")
+    return len(snap["games"])
+
+
+def main():
+    log(f"live monitor: {'AUTO-STAKE' if AUTO_STAKE else 'alerts only'} GHS {STAKE:g} · cushion {MIN_CUSHION}+ goals · "
+        f"{MIN_MINUTE}'+ · price ≤ {MAX_ODDS} · max {MAX_TICKETS} tickets/day")
+    while True:
+        try:
+            live = once()
+        except Exception as e:  # noqa: BLE001
+            log("pass failed:", e)
+            live = 1
+        if "--once" in sys.argv:
+            return
+        time.sleep(INTERVAL if live else IDLE)
+
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,5 @@
+# scrapling:local plus the patched Chromium that StealthyFetcher launches.
+# `scrapling install` skips itself when Playwright's Chromium is already present,
+# so install patchright's build explicitly.
+FROM scrapling:local
+RUN uv run patchright install chromium

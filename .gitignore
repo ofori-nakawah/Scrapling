@@ -110,3 +110,12 @@ output/*/index.html
 docs/_build
 public/
 web/
+
+# --- our additions (scrapling-custom) ---
+# Scraped data, bet tickets, downloads and logs stay on the Mac.
+/out/
+sportybet/out/
+pexels/out/
+pexels/test/
+# Signed Sportradar token (valid ~25 h, origin-checked); never commit.
+.gismo-token.json
