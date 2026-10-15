@@ -37,8 +37,8 @@ MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.20"))
 # Shadow log (the user, 2026-10-15): bets passing every rule but priced above MAX_ODDS, up to SHADOW_MAX,
 # are booked (free, never staked) and their real result recorded, to set the cap from data.
 SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.40"))
-MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "80"))          # full-match calls, second half
-MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
+MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "73"))          # full-match calls, second half
+MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "37"))    # first-half calls, first half (0 = off)
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
 # The user's rule (2026-10-15): no cap on tickets; stop for the day after 5 losing tickets. 0 = no limit.
 MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "0"))
@@ -138,7 +138,7 @@ def predictions():
     return preds
 
 
-ANALYSE_1H, ANALYSE_2H = 30, 75     # 5 minutes before the 35' and 80' windows
+ANALYSE_1H, ANALYSE_2H = MIN_MINUTE_1H - 5, MIN_MINUTE - 5     # 5 minutes before each window
 
 
 def analyse_missing(snap, preds):

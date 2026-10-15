@@ -16,7 +16,7 @@ from scrapling.fetchers import Fetcher
 API = "https://www.sportybet.com/api/gh/factsCenter/"
 H = {"user-agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
      "accept": "application/json"}
-NEAR_1H, NEAR_2H = 30, 75        # fetch every market from these minutes (the windows open at 35' and 80')
+NEAR_1H, NEAR_2H = 30, 68        # fetch every market from these minutes (windows open at 37' and 73')
 
 
 def get(path):
