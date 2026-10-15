@@ -82,7 +82,8 @@ def summarise(rows):
          "avg_conceded": avg([r["ga"] for r in rows]),
          "btts": pct([r["gf"] > 0 and r["ga"] > 0 for r in rows]),
          "scored_in": pct([r["gf"] > 0 for r in rows]),
-         "fh_o0.5": pct([x > 0.5 for x in fh]), "fh_o1.5": pct([x > 1.5 for x in fh])}
+         "fh_o0.5": pct([x > 0.5 for x in fh]), "fh_o1.5": pct([x > 1.5 for x in fh]),
+         "fh_o2.5": pct([x > 2.5 for x in fh])}
     s.update({f"o{l}": pct([t > l for t in tot]) for l in LINES})
     # Team-goal records: how often this side scored / conceded no more than n (team totals, markets 19/20).
     for n in (0, 1, 2):

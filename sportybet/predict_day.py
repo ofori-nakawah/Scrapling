@@ -11,6 +11,10 @@ Per game, every call the analysis supports (each one is a SportyBet leg "market|
   - <team> under 0.5 / 1.5 / 2.5 goals
                       that team scoring no more than the line in its last 10, averaged with the opponent
                       conceding no more than it in theirs, PRED_MIN% or more
+  - <team> to win the 1st half   the same favourite as "<team> win" (first-half 1X2, market 60)
+  - 1st half under 1.5 / 2.5     the two sides' last-10 first halves staying under the line, averaged,
+                                 PRED_MIN% or more (first-half over/under, market 68)
+First-half calls carry "half": "1H"; the live routine bets them at 35'+ in the first half, the rest at 80'+.
 A game with no supported call gets none, and the live routine never bets it.
 """
 import datetime as dt, json, math, os, sys
@@ -50,6 +54,15 @@ def calls(g):
     if side and price <= DC_MAX_ODDS:
         out.append({"name": f"{team[side]} or draw", "kind": "dc", "side": side,
                     "leg": f"10||{'9' if side == 'home' else '11'}", "why": why})
+    if side and price <= FAV_MAX_ODDS:
+        out.append({"name": f"{team[side]} to win the 1st half", "kind": "fh_win", "side": side, "half": "1H",
+                    "leg": f"60||{'1' if side == 'home' else '3'}", "why": why})
+    for line in (1.5, 2.5):
+        a, b = s["home"].get(f"fh_o{line}"), s["away"].get(f"fh_o{line}")
+        if a is not None and b is not None and 100 - round((a + b) / 2) >= PRED_MIN:
+            out.append({"name": f"1st half under {line}", "kind": "fh_under", "line": line, "half": "1H",
+                        "leg": f"68|total={line}|13", "why": f"last-10 first halves under {line}: {100 - round((a + b) / 2)}%"})
+            break                         # the lowest line that holds
     for line in (2.5, 3.5):
         o = s["blend"].get(f"o{line}")
         if o is not None and 100 - o >= PRED_MIN:
@@ -76,7 +89,7 @@ def main():
     out = {}
     for g in games:
         picks, why = calls(g)
-        win = next((p for p in picks if p["kind"] == "win"), None)
+        win = next((p for p in picks if p["kind"] == "win"), None)  # the full-match winner call
         out[g["event_id"]] = {"match": f"{g['home_team']} v {g['away_team']}", "kickoff_utc": g["kickoff_utc"],
                               "home": g["home_team"], "away": g["away_team"], "picks": picks,
                               "side": win["side"] if win else None, "team": win["name"][:-4] if win else None,
