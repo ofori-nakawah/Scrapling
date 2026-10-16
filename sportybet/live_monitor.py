@@ -34,10 +34,11 @@ OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = True
 STAKE = 100.0                          # the stake when lanes are off
-# Lanes (the user, 2026-10-16): every GHS 100 is a lane rolling its winnings; at 200 it splits in two; lanes.py.
+# Lanes (the user, 2026-10-16): a lane starts at 200 and rolls its winnings; at 500 it splits into 200 + 200 and
+# 100 to the reserve; the reserve funds a new 200 lane; lanes.py.
 LANES_ON = True
-LANE_START = 100.0
-LANE_SPLIT = 200.0
+LANE_START = 200.0
+LANE_SPLIT = 500.0
 MAX_ODDS = 1.15
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
