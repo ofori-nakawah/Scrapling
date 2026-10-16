@@ -317,6 +317,8 @@ def matches(snap, preds, staked):
                 continue
             by_side = markets_model.cushion_by_side(r[0], halves, now)
             danger = [sd for sd, n in zip(("home", "away"), by_side) if n <= markets_model.MAX_EXTRA]
+            if not danger:
+                danger = ["home", "away"]     # no side can lose it alone: goals from both together are the danger
             name = f"{mdesc}: {odesc}" if mdesc else odesc
             cand = {"name": name, "price": price, "cushion": need, "pre_match": round(pc * 100), "danger": danger,
                     "leg": f"{g['event']}/{mid}/{spec}/{oid}"}
@@ -572,6 +574,22 @@ def check_balance_morning():
 
 # ---- staking --------------------------------------------------------------------------------
 
+STAKING = OUT / "STAKING"     # present while a placement runs; restart_monitor.sh waits for it
+
+
+def interrupted_check():
+    """At start: a ticket left 'attempted' means a placement was cut off (e.g. a restart mid-stake). Its
+    result is unknown, so staking halts until a person checks Bet History (never guessed, never retried)."""
+    for d in (today() - dt.timedelta(days=1), today()):
+        for t in read(tickets_file(d), []):
+            if t.get("state") == "attempted":
+                HALT.write_text(f"{t['at']} {t['code']}: placement was interrupted; result unknown")
+                telegram(f"⚠️ Ticket {t['code']}: the placement was interrupted, result unknown. Auto-staking is "
+                         f"halted. Check Bet History, then delete {HALT} to resume.", "halt")
+                log(f"halted: {t['code']} was left mid-placement")
+    STAKING.unlink(missing_ok=True)
+
+
 def stake(group, tickets):
     legs = [g["pick"]["leg"] for g in group]
     odds = 1.0
@@ -592,6 +610,7 @@ def stake(group, tickets):
          "games": desc, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "state": "attempted"}
     tickets.append(t)
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))   # recorded before any click
+    STAKING.write_text(t["code"])
     log(f"STAKING {code}: {desc}")
     try:
         r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--place", "--headless"],
@@ -614,6 +633,7 @@ def stake(group, tickets):
         telegram(f"⚠️ Ticket {code}: placement result UNCLEAR. Auto-staking is halted. Check Bet History, "
                  f"then delete {HALT} to resume.\n{desc}", "halt")
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))
+    STAKING.unlink(missing_ok=True)
     log(f"{code}: {t['state']}")
     return t
 
@@ -780,6 +800,8 @@ def once():
 
 
 def main():
+    OUT.mkdir(parents=True, exist_ok=True)
+    interrupted_check()
     log(f"live monitor: {'AUTO-STAKE' if AUTO_STAKE else 'alerts only'} GHS {STAKE:g} · cushion {MIN_CUSHION}+ goals · "
         f"1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · price ≤ {MAX_ODDS} · max {MAX_OPEN} open slips · stop after {MAX_LOSSES} losses/day"
         f"{f' · max {MAX_TICKETS} tickets/day' if MAX_TICKETS else ' · no ticket cap'}")
