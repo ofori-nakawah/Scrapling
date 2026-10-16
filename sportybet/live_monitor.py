@@ -658,7 +658,10 @@ def stake(group, tickets):
     try:
         r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--max-odds", f"{max_total:.2f}",
                             "--place", "--headless"],
-                           cwd=BOT, capture_output=True, text=True, timeout=420)
+                           cwd=BOT, capture_output=True, text=True, timeout=420,
+                           # Half the bet script's human-pace pauses (still 0.75-2 s): a dry run measured
+                           # 26.7 s at pace 1 and 19.0 s at 0.5 (2026-10-16). Prices move while it runs.
+                           env={**os.environ, "SB_PACE": os.environ.get("SB_PACE", "0.5")})
         out, rc = r.stdout + r.stderr, r.returncode
     except subprocess.TimeoutExpired as e:
         out, rc = str(e), 3
