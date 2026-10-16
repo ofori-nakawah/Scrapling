@@ -118,6 +118,7 @@ for ev in events:
                 except ValueError:
                     pass
             games.append({"prices": {"|".join(k): v for k, v in px_all.items()}, "event": ev["eventId"],
+                          "kickoff": ev.get("estimateStartTime"),
                           "halves": halves, "outcomes": outcomes(ev) if full else [], "minute": minute(ev), "period": ev.get("matchStatus"),
                           "score": ev.get("setScore"), "home": ev["homeTeamName"], "away": ev["awayTeamName"],
                           "league": f"{cat['name']} · {cat['tournament']['name']}",

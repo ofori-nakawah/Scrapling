@@ -432,6 +432,53 @@ def live_check(group):
     return kept
 
 
+# ---- batching (the user, 2026-10-16: bigger odds per 5 cedis) -------------------------------------
+HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "3"))     # wait at most this long for sibling games
+SIBLING_KICKOFF_MIN = 5                                        # kicked off within 5 minutes of each other
+_held = {}       # event|half -> when it first qualified while waiting for siblings
+
+
+def pending_siblings(group, snap, preds, staked):
+    """Analysed games that kicked off with a qualifying one and are close to (or in) the same window but
+    have not qualified yet: worth a short wait so they can share the slip."""
+    in_group = {g["event"] for g in group}
+    out = []
+    for g in group:
+        k = g.get("kickoff")
+        if not k:
+            continue
+        for s in snap["games"]:
+            if s["event"] in in_group or s["event"] in {x["event"] for x in out} or not s.get("kickoff"):
+                continue
+            if abs(s["kickoff"] - k) > SIBLING_KICKOFF_MIN * 60_000:
+                continue
+            p = preds.get(s["event"]) or {}
+            if not p.get("model") or f"{s['event']}|{g['half']}" in staked or s["minute"] is None:
+                continue
+            near = ((g["half"] == "1H" and s["period"] == "H1" and s["minute"] >= MIN_MINUTE_1H - 5) or
+                    (g["half"] == "FT" and s["period"] == "H2" and s["minute"] >= MIN_MINUTE - 5))
+            if near:
+                out.append(s)
+    return out
+
+
+def hold(group, snap, preds, staked):
+    """True while the qualifying games should wait for siblings (at most HOLD_MINUTES from the first)."""
+    now = time.time()
+    keys = [f"{g['event']}|{g['half']}" for g in group]
+    for k in keys:
+        _held.setdefault(k, now)
+    waiting = pending_siblings(group, snap, preds, staked)
+    age = now - min(_held[k] for k in keys)
+    if waiting and age < HOLD_MINUTES * 60:
+        log(f"holding {', '.join(g['home'] + ' v ' + g['away'] for g in group)} for "
+            f"{', '.join(s['home'] + ' v ' + s['away'] for s in waiting)} ({HOLD_MINUTES * 60 - age:.0f}s left)")
+        return True
+    for k in keys:
+        _held.pop(k, None)
+    return False
+
+
 # ---- guards ---------------------------------------------------------------------------------
 
 def tickets_file(day):
@@ -686,6 +733,8 @@ def once():
     except Exception as e:  # noqa: BLE001
         log("shadow log failed:", e)
     note = ""
+    if group and AUTO_STAKE and hold(group, snap, preds, staked):
+        group = []                        # re-checked next pass with any siblings that qualify meanwhile
     if group:
         names = ", ".join(f"{g['pick']['name']} ({g['home']} {g['score']} {g['away']}, {g['minute']}')" for g in group)
         why = refusal(tickets, open_now) if AUTO_STAKE else "alerts only (AUTO_STAKE=0)"
