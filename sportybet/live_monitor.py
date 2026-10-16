@@ -382,10 +382,16 @@ def flashscore(games):
 
 
 def live_block(stats, danger):
-    """Why the live game argues against the bet, or None. The danger side is the team whose goals lose it."""
+    """Why the live game does not back the bet, or None. The danger side is the team whose goals lose it;
+    the other side is the one the bet relies on.
+
+    Vetoes: the danger side has a man advantage, LIVE_RECENT_SOT+ shots on target in the last 10', or
+    LIVE_DA_PCT%+ of the dangerous attacks. Agreement (the user, 2026-10-16: the live game must match the
+    pre-game analysis and the score): with one danger side, the side the bet relies on must be at least
+    level with it on shots on target and on dangerous attacks (possession when a league has no attack
+    stats); with both sides dangerous, the game must be quiet (no side with 60%+ of the attacks, at most
+    one shot on target between them in the last 10')."""
     if not stats:
-        # The user (2026-10-16): stake only when the morning analysis, the live analysis and the score all
-        # agree, so a game without live stats is not staked.
         return "no live stats for this game"
     idx = {"home": 0, "away": 1}
     for d in danger:
@@ -400,6 +406,21 @@ def live_block(stats, danger):
             return f"{d} {stats['sot'][i]} shots on target to {stats['sot'][o]} (no recent-minutes data)"
         if stats.get("da_pct") and stats["da_pct"][i] >= LIVE_DA_PCT:
             return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
+    share = stats.get("da_pct") or stats.get("possession")
+    share_name = "dangerous attacks" if stats.get("da_pct") else "possession"
+    if len(danger) == 1:
+        i = idx[danger[0]]
+        o = 1 - i
+        mine = "away" if danger[0] == "home" else "home"
+        if stats["sot"][o] < stats["sot"][i]:
+            return f"live does not back it: {mine} {stats['sot'][o]} shots on target to {danger[0]}'s {stats['sot'][i]}"
+        if share and share[o] < share[i]:
+            return f"live does not back it: {mine} {share[o]}% of {share_name} to {danger[0]}'s {share[i]}%"
+    elif len(danger) == 2:
+        if share and max(share) >= 60:
+            return f"live does not back it: one side has {max(share)}% of {share_name}"
+        if stats.get("recent") and sum(stats["recent"]["sot"]) > 1:
+            return f"live does not back it: {sum(stats['recent']['sot'])} shots on target in the last 10'"
     return None
 
 
