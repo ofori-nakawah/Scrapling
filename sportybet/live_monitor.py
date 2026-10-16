@@ -48,7 +48,7 @@ MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "2"))   # the user: 2 (202
 MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "5"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
 # While an analysed game is near or inside a window, check more often: prices and scores move fast there.
-FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "30"))
+FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "15"))  # the user: 15 (2026-10-16; was 30)
 NEAR = {"any": False}
 BETSLIP_CHECK = {"at": 0.0}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
