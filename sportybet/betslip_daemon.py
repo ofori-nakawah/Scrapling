@@ -205,8 +205,16 @@ class Betslip:
 
         typed = page.eval_on_selector(STAKE_BOX, "el => el.value")
         totals = page.evaluate(SLIP_TOTALS)
-        if not totals["totalOdds"] and len(legs) == 1:
-            totals["totalOdds"] = legs[0]["odds"]
+        if not totals["totalOdds"] and legs:
+            # A single has no total row; on a live multiple the row can't always be read (9G5ESK, 2026-10-16), so the
+            # total is the product of the slip's own leg prices.
+            try:
+                prod = 1.0
+                for l in legs:
+                    prod *= float(l["odds"])
+                totals["totalOdds"] = f"{prod:.2f}"
+            except ValueError:
+                pass
         say(f"{code} — {len(legs)} legs on the slip")
         for l in legs:
             say(f"  {l['odds']:>6}  {l['match']}\n          {l['market']} -> {l['pick']}")
