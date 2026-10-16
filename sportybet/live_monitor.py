@@ -53,7 +53,7 @@ NEAR = {"any": False}
 BETSLIP_CHECK = {"at": 0.0}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
-PRED_MIN = int(os.environ.get("PRED_MIN", "80"))   # pre-match chance (%) an outcome needs (the user: 80, 2026-10-15)
+PRED_MIN = int(os.environ.get("PRED_MIN", "70"))   # pre-match chance (%) an outcome needs (the user: 70 with live agreement, 2026-10-16; was 80)
 
 sys.path.insert(0, str(HERE))
 import markets_model  # noqa: E402
