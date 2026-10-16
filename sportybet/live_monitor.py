@@ -703,7 +703,28 @@ def resolve_from_history(t):
     return "not_placed_verified"
 
 
+def open_bet_events():
+    """Every game on an open bet in Bet History (the account itself, not the monitor's records)."""
+    import buddy_tools as bt
+    d = bt.account_get("orders/order/v2/realbetlist?isSettled=0&pageSize=50&pageNo=1")
+    return {x.get("eventId") for o in ((d.get("entityList") if isinstance(d, dict) else d) or [])
+            for x in o.get("selections") or []}
+
+
 def stake(group, tickets):
+    # The user, 2026-10-16: a game must never be staked twice. Before every stake, games already on an open bet
+    # in Bet History are dropped; if Bet History can't be read, nothing is staked this pass.
+    try:
+        already = open_bet_events()
+    except Exception as e:  # noqa: BLE001
+        log(f"not staked: Bet History unreadable before staking ({e})")
+        return None
+    dup = [g for g in group if g["event"] in already]
+    if dup:
+        log("already on an open bet, dropped: " + ", ".join(f"{g['home']} v {g['away']}" for g in dup))
+        group = [g for g in group if g["event"] not in already]
+        if not group:
+            return None
     legs = [g["pick"]["leg"] for g in group]
     odds = 1.0
     for g in group:
