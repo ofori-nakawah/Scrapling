@@ -29,36 +29,91 @@ import datetime as dt, html, json, math, os, subprocess, sys, time
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+RULES_FILE = HERE / "rules.json"
 OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
-AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
-STAKE = float(os.environ.get("STAKE", "100"))  # the user: 100 (2026-10-16; was 5, then 40)
-MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.15"))
+AUTO_STAKE = True
+STAKE = 100.0
+MAX_ODDS = 1.15
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
 # recorded, to set the cap from data. Ones within MAX_ODDS are also staked as usual ("within_cap").
-SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.40"))
-MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "70"))          # full-match calls, second half
-MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
-MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
+SHADOW_MAX = 1.40
+MIN_MINUTE = 70                       # full-match calls, second half
+MIN_MINUTE_1H = 35                    # first-half calls, first half (0 = off)
+MIN_CUSHION = 2
 # The user's rule (2026-10-15): no cap on tickets; stop for the day after 5 losing tickets. 0 = no limit.
-MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "0"))
-MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "2"))   # the user: 2 (2026-10-16; was 5)
+MAX_TICKETS = 0
+MAX_LOSSES = 2
 # At most this many slips open (placed, not yet settled) at once; the user's rule, 2026-10-15. 0 = no limit.
-MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "5"))
-INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
+MAX_OPEN = 5
+INTERVAL, IDLE = 60, 300
 # While an analysed game is near or inside a window, check more often: prices and scores move fast there.
-FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "15"))  # the user: 15 (2026-10-16; was 30)
+FAST_INTERVAL = 15
 NEAR = {"any": False}
 BETSLIP_CHECK = {"at": 0.0}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
-PRED_MIN = int(os.environ.get("PRED_MIN", "80"))   # pre-match chance (%) an outcome needs (the user, 2026-10-16: back to 80)
+PRED_MIN = 80                         # pre-match chance (%) every bet needs
 
 sys.path.insert(0, str(HERE))
 import markets_model  # noqa: E402
 
 sys.path.insert(0, str(BOT / "scripts"))
+
+
+# rules.json key -> (module setting, type). The file is read at the start of every check.
+RULES = {
+    "auto_stake": ("AUTO_STAKE", bool), "stake_ghs": ("STAKE", float), "max_price": ("MAX_ODDS", float),
+    "first_half_from_minute": ("MIN_MINUTE_1H", int), "full_match_from_minute": ("MIN_MINUTE", int),
+    "goals_to_lose": ("MIN_CUSHION", int), "whole_game_under_goals_to_lose": ("WHOLE_UNDER_CUSHION", int),
+    "pre_match_min_pct": ("PRED_MIN", int), "live_check": ("LIVE_CHECK", bool),
+    "live_block_recent_shots_on_target": ("LIVE_RECENT_SOT", int), "live_block_attack_share_pct": ("LIVE_DA_PCT", int),
+    "max_open_slips": ("MAX_OPEN", int), "max_losses_per_day": ("MAX_LOSSES", int), "max_slips_per_day": ("MAX_TICKETS", int),
+    "batch_wait_minutes": ("HOLD_MINUTES", float), "price_rise_allowed": ("PRICE_RISE", float),
+    "shadow_log_max_price": ("SHADOW_MAX", float), "check_every_s_near_window": ("FAST_INTERVAL", int),
+    "check_every_s": ("INTERVAL", int), "check_every_s_no_games": ("IDLE", int),
+    "refresh_analysis_hours": ("REFRESH_HOURS", float), "warm_betslip": ("WARM_BETSLIP", bool), "telegram": ("NOTIFY", set),
+}
+_rules_seen = {"mtime": None, "bad": False}
+
+
+def load_rules():
+    """Apply rules.json (every check, so edits take effect without a restart). A missing or broken file keeps
+    the last good rules and is reported once. AUTO_STAKE=0 in the environment forces alerts-only (test runs)."""
+    g = globals()
+    try:
+        mtime = RULES_FILE.stat().st_mtime
+        if mtime == _rules_seen["mtime"]:
+            return
+        data = json.loads(RULES_FILE.read_text())
+        changed = []
+        for key, (name, kind) in RULES.items():
+            if key in data:
+                v = kind(data[key])
+                if g[name] != v:
+                    changed.append(f"{key}={data[key]}")
+                g[name] = v
+        unknown = [k for k in data if k not in RULES and not k.startswith("_")]
+        if unknown:
+            log("rules.json: unknown keys ignored:", ", ".join(unknown))
+        g["ANALYSE_1H"], g["ANALYSE_2H"] = g["MIN_MINUTE_1H"] - 5, g["MIN_MINUTE"] - 5
+        if _rules_seen["mtime"] is not None and changed:
+            log("rules changed:", ", ".join(changed))
+        _rules_seen.update(mtime=mtime, bad=False)
+    except (OSError, ValueError, TypeError) as e:
+        if not _rules_seen["bad"]:
+            log("rules.json unreadable, keeping the last good rules:", e)
+            telegram(f"⚠️ rules.json could not be read ({e}). The monitor keeps its last good rules until it is fixed.", "halt")
+        _rules_seen["bad"] = True
+    if os.environ.get("AUTO_STAKE") == "0":
+        g["AUTO_STAKE"] = False
+
+
+def rules_summary():
+    return (f"GHS {STAKE:g} · 1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · {MIN_CUSHION}+ goals to lose "
+            f"({WHOLE_UNDER_CUSHION}+ for whole-game unders) · {PRED_MIN}% pre-match · live check "
+            f"{'on' if LIVE_CHECK else 'OFF'} · price ≤ {MAX_ODDS} · max {MAX_OPEN} open · stop after {MAX_LOSSES} losses/day")
 
 
 def log(*a):
@@ -72,7 +127,7 @@ def today():
 WORKER = "scrapling-worker"
 # Stake through the warm Scrapling betslip (betslip_daemon.py, ~10 s) instead of stage-bet.js (~20-30 s): the user,
 # 2026-10-16. stage-bet.js stays the fallback when the betslip daemon is not reachable.
-WARM_BETSLIP = os.environ.get("WARM_BETSLIP", "1") == "1"
+WARM_BETSLIP = True
 VENV_PY = "/app/.venv/bin/python"
 
 
@@ -122,7 +177,7 @@ def container(script, *args, timeout=240):
 
 # Which events reach Telegram (env NOTIFY, comma-separated): morning, matched, staked, won, lost, halt, balance.
 # The user asked for wins only (2026-10-15); everything still goes to the log and the live page.
-NOTIFY = {k.strip() for k in os.environ.get("NOTIFY", "won").split(",") if k.strip()}
+NOTIFY = {"morning", "matched", "staked", "won", "lost", "halt", "balance"}
 
 
 def telegram(text, kind):
@@ -144,7 +199,7 @@ def read(path, default):
 
 # ---- the morning analysis ----------------------------------------------------------------
 
-REFRESH_HOURS = float(os.environ.get("REFRESH_HOURS", "3"))
+REFRESH_HOURS = 3.0
 
 
 def ensure_predictions(day):
@@ -169,9 +224,8 @@ def ensure_predictions(day):
         log(f"refresh: {len(merged) - len(before)} new games, {len(added)} with calls")
         return
     called = [v for v in merged.values() if v.get("picks")]
-    telegram(f"📋 {day}: {len(called)} games with morning calls. Staking GHS {STAKE:.0f} when a call is "
-             f"{MIN_CUSHION}+ goals from losing at {MIN_MINUTE_1H}'+ (1st half) or {MIN_MINUTE}'+ at {MAX_ODDS:.2f} or less." if AUTO_STAKE else
-             f"📋 {day}: {len(called)} games with morning calls (alerts only).", "morning")
+    telegram(f"📋 {day}: {len(called)} games analysed.\n"
+             f"{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: {rules_summary()}", "morning")
     check_balance_morning()
 
 
@@ -227,35 +281,6 @@ def analyse_missing(snap, preds):
 
 # ---- matching -------------------------------------------------------------------------------
 
-def cushion(pick, h, a):
-    """Goals that would have to come, the wrong way, for this call to lose at the current score."""
-    side = {"home": h, "away": a}
-    if pick["kind"] in ("win", "fh_win", "dc", "hcp"):
-        lead = side[pick["side"]] - side["away" if pick["side"] == "home" else "home"]
-        if pick["kind"] in ("dc", "hcp") and lead < 1:
-            return 0              # or-draw / handicap only ride a predicted side that is already ahead
-        return max(0, lead + {"win": 0, "fh_win": 0, "dc": 1, "hcp": pick.get("k", 0)}[pick["kind"]])
-    if pick["kind"] in ("total_under", "fh_under"):   # in the first half the score IS the first-half score
-        return max(0, math.floor(pick["line"]) - (h + a) + 1)
-    if pick["kind"] == "team_under":
-        return max(0, math.floor(pick["line"]) - side[pick["side"]] + 1)
-    return 0
-
-
-def handicaps(picks):
-    """For each predicted winner, the same side on SportyBet's handicap market (14) with a +1 and a +2
-    start: leading 1:0 with +1 reads 2:0, so one late goal (2:1) still wins."""
-    out = []
-    for c in picks:
-        if c["kind"] != "win":
-            continue
-        for k in (1, 2):
-            spec, outcome = (f"hcp={k}:0", "1711") if c["side"] == "home" else (f"hcp=0:{k}", "1713")
-            out.append({"name": f"{c['name'][:-4]} handicap +{k}", "kind": "hcp", "side": c["side"], "k": k,
-                        "leg": f"14|{spec}|{outcome}"})
-    return out
-
-
 def window(g):
     """"1H" at MIN_MINUTE_1H+ in the first half, "FT" at MIN_MINUTE+ in the second, else None."""
     if g["minute"] is None:
@@ -272,9 +297,8 @@ def window(g):
 #   over-under, total-goal ranges, exact and excluded totals, and combos or "X or" markets with a total);
 # - handicaps only on the pre-match favourite (European and Asian, any period; no handicap draw).
 # The user, 2026-10-16: the whole-game under (market 18) is back, but only when 3+ goals would be needed to lose.
-WHOLE_UNDER_CUSHION = int(os.environ.get("WHOLE_UNDER_CUSHION", "3"))
+WHOLE_UNDER_CUSHION = 3
 # ...and for those, a lower pre-match bar: the user, 2026-10-16 ("if live agrees and pre-game is above 60").
-WHOLE_UNDER_PRED_MIN = int(os.environ.get("WHOLE_UNDER_PRED_MIN", "80"))   # the user, 2026-10-16: 80 like every bet
 COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
 COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
@@ -375,8 +399,7 @@ def matches(snap, preds, staked):
             if str(mid) == "18" and need < WHOLE_UNDER_CUSHION:
                 continue                  # whole-game unders need three goals to lose (the user, 2026-10-16)
             pc = chance(g["event"], p["model"], o)
-            bar = WHOLE_UNDER_PRED_MIN if str(mid) == "18" else PRED_MIN   # whole-game unders reach here only with 3+ to lose
-            if pc is None or pc * 100 < bar:
+            if pc is None or pc * 100 < PRED_MIN:
                 continue
             by_side = markets_model.cushion_by_side(r[0], halves, now)
             danger = [sd for sd, n in zip(("home", "away"), by_side) if n <= markets_model.MAX_EXTRA]
@@ -396,9 +419,9 @@ def matches(snap, preds, staked):
 
 
 # ---- the live check (Sportradar's live match stats, just before staking) --------------------
-LIVE_CHECK = os.environ.get("LIVE_CHECK", "1") == "1"
-LIVE_RECENT_SOT = int(os.environ.get("LIVE_RECENT_SOT", "2"))     # danger side's shots on target, last 10'
-LIVE_DA_PCT = int(os.environ.get("LIVE_DA_PCT", "70"))            # danger side's dangerous-attack share
+LIVE_CHECK = True
+LIVE_RECENT_SOT = 2                   # danger side's shots on target, last 10'
+LIVE_DA_PCT = 70                      # danger side's dangerous-attack share
 
 
 def live_stats(events, minute):
@@ -412,40 +435,6 @@ def live_stats(events, minute):
         return {}
 
 
-FS_DOMINANT_SOT = int(os.environ.get("FS_DOMINANT_SOT", "4"))   # Flashscore with no history: whole-match check
-_history = {}    # event -> [(minute, [sot home, sot away])], from either source, for recent pressure
-
-
-def remember(event, minute, stats):
-    if stats and minute is not None:
-        _history.setdefault(event, []).append((minute, list(stats["sot"])))
-
-
-def recent_from_history(event, minute, stats):
-    """Shots on target since the reading closest to 10 minutes ago (needs one at least 8 minutes old)."""
-    old = [(m, s) for m, s in _history.get(event, []) if m <= minute - 8]
-    if not old or not stats:
-        return None
-    _, then = max(old, key=lambda x: x[0])
-    return {"sot": [max(0, stats["sot"][0] - then[0]), max(0, stats["sot"][1] - then[1])], "shots": None}
-
-
-def flashscore(games):
-    """The fallback source for games Sportradar does not cover (one browser run for all of them)."""
-    if not games:
-        return {}
-    (OUT / "fs-in.json").write_text(json.dumps([{"event": g["event"], "home": g["home"], "away": g["away"],
-                                                 "score": g["score"]} for g in games]))
-    try:
-        got = json.loads(container("flashscore_stats.py", "/work/out/live/fs-in.json", timeout=300))
-    except Exception as e:  # noqa: BLE001
-        log("flashscore failed:", e)
-        return {}
-    for g in games:
-        log(f"flashscore: {g['home']} v {g['away']} -> " + (got.get(g["event"]) or {}).get("flashscore", "no confident match"))
-    return {k: v for k, v in got.items() if v}
-
-
 def live_block(stats, danger):
     """Why the live game does not back the bet, or None. The danger side is the team whose goals lose it;
     the other side is the one the bet relies on.
@@ -453,8 +442,7 @@ def live_block(stats, danger):
     Vetoes: the danger side has a man advantage, LIVE_RECENT_SOT+ shots on target in the last 10', or
     LIVE_DA_PCT%+ of the dangerous attacks. Agreement (the user, 2026-10-16: the live game must match the
     pre-game analysis and the score): with one danger side, the side the bet relies on must be at least
-    level with it on shots on target and on dangerous attacks (possession when a league has no attack
-    stats); with both sides dangerous, the game must be quiet (no side with 60%+ of the attacks, at most
+    level with it on shots on target and on dangerous attacks (Sportradar live stats; a game it does not cover is not staked); with both sides dangerous, the game must be quiet (no side with 60%+ of the attacks, at most
     one shot on target between them in the last 10')."""
     if not stats:
         return "no live stats for this game"
@@ -463,16 +451,11 @@ def live_block(stats, danger):
         i, o = idx[d], 1 - idx[d]
         if stats["red"][o] > stats["red"][i]:
             return f"{d} has a man advantage (red card)"
-        if stats.get("recent"):
-            if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
-                return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
-        elif stats["sot"][i] >= FS_DOMINANT_SOT and stats["sot"][i] >= 2 * stats["sot"][o]:
-            # No timeline and no reading from 10 minutes ago: judge the whole match instead.
-            return f"{d} {stats['sot'][i]} shots on target to {stats['sot'][o]} (no recent-minutes data)"
+        if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
+            return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
         if stats.get("da_pct") and stats["da_pct"][i] >= LIVE_DA_PCT:
             return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
-    share = stats.get("da_pct") or stats.get("possession")
-    share_name = "dangerous attacks" if stats.get("da_pct") else "possession"
+    share, share_name = stats.get("da_pct"), "dangerous attacks"
     if len(danger) == 1:
         i = idx[danger[0]]
         o = 1 - i
@@ -484,7 +467,7 @@ def live_block(stats, danger):
     elif len(danger) == 2:
         if share and max(share) >= 60:
             return f"live does not back it: one side has {max(share)}% of {share_name}"
-        if stats.get("recent") and sum(stats["recent"]["sot"]) > 1:
+        if sum(stats["recent"]["sot"]) > 1:
             return f"live does not back it: {sum(stats['recent']['sot'])} shots on target in the last 10'"
     return None
 
@@ -495,14 +478,6 @@ def live_check(group):
         return group
     stats = live_stats([g["event"] for g in group] + [c["event"] for c in SHADOWS],
                        max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0]))
-    # Sportradar first; Flashscore for games it does not cover (the user, 2026-10-16).
-    stats.update(flashscore([g for g in group if not stats.get(g["event"])]))
-    minutes = {g["event"]: g["minute"] for g in group}
-    minutes.update({c["event"]: c["minute"] for c in SHADOWS})
-    for ev, st in stats.items():
-        if st and st.get("source") == "flashscore":
-            st["recent"] = recent_from_history(ev, minutes.get(ev, 0), st)
-        remember(ev, minutes.get(ev), st)
     for c in SHADOWS:
         c["live"] = stats.get(c["event"])
         c["live_block"] = live_block(c["live"], c["danger"])
@@ -519,7 +494,7 @@ def live_check(group):
 
 
 # ---- batching (the user, 2026-10-16: bigger odds per 5 cedis) -------------------------------------
-HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "1.5"))   # wait at most this long for sibling games (the user: 1.5)
+HOLD_MINUTES = 1.5                    # wait at most this long for sibling games
 SIBLING_KICKOFF_MIN = 5                                        # kicked off within 5 minutes of each other
 _held = {}       # event|half -> when it first qualified while waiting for siblings
 
@@ -638,7 +613,7 @@ def check_balance_morning():
 # ---- staking --------------------------------------------------------------------------------
 
 STAKING = OUT / "STAKING"     # present while a placement runs; restart_monitor.sh waits for it
-PRICE_RISE = float(os.environ.get("PRICE_RISE", "0.03"))   # how far a price may rise between scan and click
+PRICE_RISE = 0.03                     # how far a price may rise between scan and click
 HEARTBEAT = OUT / "heartbeat"  # touched every pass; watchdog.py alerts when it goes stale
 
 
@@ -800,15 +775,7 @@ def page(snap, preds, tickets, note):
             h, a = map(int, (g["score"] or "").split(":"))
         except ValueError:
             h = a = None
-        bits = []
-        for c in p.get("picks") or []:
-            pr = g.get("prices", {}).get(c["leg"])
-            need = cushion(c, h, a) if h is not None else None
-            hot = pr is not None and pr <= MAX_ODDS and need is not None and need >= MIN_CUSHION
-            bits.append(f"<span class='pk{' hot' if hot else ''}'>{e(c['name'])} <b>{pr:.2f}</b>" if pr else
-                        f"<span class=pk>{e(c['name'])} <small>closed</small>")
-            bits[-1] += f"<small> · {need} to lose</small></span>" if need is not None else "</span>"
-        call = " ".join(bits) or "<small>no call</small>"
+        call = (f"analysed · {len(p.get('picks') or [])} calls" if p.get("model") else "<small>not analysed</small>")
         price = ""
         late = window(g) is not None
         rows.append(f"<tr class='{'late' if late else ''}'><td>{g['minute'] if g['minute'] is not None else '–'}'</td>"
@@ -824,15 +791,16 @@ td{{padding:6px;border-bottom:1px solid #e5e5e5;vertical-align:top}}.sc{{font-si
 small{{color:#777}}.note{{padding:8px 12px;background:#f4f4f4;border-radius:8px}}
 .pk{{display:inline-block;margin:0 6px 4px 0;padding:2px 8px;border-radius:12px;background:#f0f0f0}}.pk.hot{{background:#c8f0d0}}</style>
 <h2>Live football — {len(snap['games'])} games</h2>
-<p class=note>{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: a morning call {MIN_CUSHION}+ goals from losing — 1st-half calls at {MIN_MINUTE_1H}'+, full-match calls at {MIN_MINUTE}'+ — priced ≤ {MAX_ODDS:.2f} (green), GHS {STAKE:.0f}.
+<p class=note>{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: {rules_summary()} (rules.json)
 {('<br><b>' + e(note) + '</b>') if note else ''}<br><small>Updated {at} · refreshes every 30 s</small></p>
 <h3>Today's tickets</h3><table>{trows}</table>
-<h3>Live</h3><table><tr><td></td><td></td><td></td><td><small>morning calls · live price · goals to lose</small></td><td></td></tr>{''.join(rows)}</table>""")
+<h3>Live</h3><table>{''.join(rows)}</table>""")
 
 
 # ---- the loop -------------------------------------------------------------------------------
 
 def once():
+    load_rules()
     day = today()
     OUT.mkdir(parents=True, exist_ok=True)
     HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "start"}))
@@ -902,9 +870,8 @@ def once():
 def main():
     OUT.mkdir(parents=True, exist_ok=True)
     interrupted_check()
-    log(f"live monitor: {'AUTO-STAKE' if AUTO_STAKE else 'alerts only'} GHS {STAKE:g} · cushion {MIN_CUSHION}+ goals · "
-        f"1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · price ≤ {MAX_ODDS} · max {MAX_OPEN} open slips · stop after {MAX_LOSSES} losses/day"
-        f"{f' · max {MAX_TICKETS} tickets/day' if MAX_TICKETS else ' · no ticket cap'}")
+    load_rules()
+    log(f"live monitor: {'AUTO-STAKE' if AUTO_STAKE else 'alerts only'} · {rules_summary()}")
     while True:
         try:
             live = once()

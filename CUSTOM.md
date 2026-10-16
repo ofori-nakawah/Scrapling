@@ -51,3 +51,9 @@ about 10 s a stake instead of 20-30 s. The worker mounts `claudesportybot/.chrom
 the saved session, which pulld's keep-alive renews hourly. `betslip.py CODE --stake N --to-confirm` tests
 everything up to SportyBet's confirm panel without confirming. If the daemon is down, the monitor falls
 back to `stage-bet.js`.
+
+## The rules
+
+Every rule the live monitor uses is in `sportybet/rules.json`: stake, windows, goals to lose, pre-match bar,
+live check, price cap, limits, Telegram messages. It is read at the start of every check, so an edit applies
+within a minute with no restart. A broken file keeps the last good rules and sends one Telegram alert.
