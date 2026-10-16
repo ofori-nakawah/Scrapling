@@ -203,6 +203,19 @@ class Betslip:
         page.keyboard.press("Tab")
         page.wait_for_timeout(800)
 
+        # Live prices move: SportyBet then swaps Place Bet for "Accept Changes" (seen on 9G5ESK, 2026-10-16).
+        # Accepting only updates the slip to the current prices, nothing is placed; every check below (--max-odds
+        # included) then runs on the new prices.
+        for _ in range(3):
+            acc = page.query_selector("#j_betslip button:has-text('Accept Changes'), #j_betslip [class*=btn]:has-text('Accept Changes')")
+            if not acc or not acc.is_visible():
+                break
+            say("prices changed on the slip: accepting the current prices (checks run on them)")
+            pause(page, *GLANCE)
+            acc.click()
+            page.wait_for_timeout(1000)
+        legs = slip_legs(page)
+
         typed = page.eval_on_selector(STAKE_BOX, "el => el.value")
         totals = page.evaluate(SLIP_TOTALS)
         if not totals["totalOdds"] and legs:
@@ -249,7 +262,13 @@ class Betslip:
             ok = False
         btn = page.query_selector(f"{PLACE_BET}:not([disabled])")
         if not btn or not btn.is_visible():
-            say("The Place Bet button is not on the slip.")
+            # Say what the slip shows instead (an odds-change prompt, a suspended leg, a disabled button).
+            foot = page.evaluate("""() => { const r = document.querySelector('#j_betslip');
+                const b = [...(r?.querySelectorAll('button, [class*=btn]') ?? [])].map(e => e.innerText.trim()).filter(Boolean);
+                const tips = [...(r?.querySelectorAll('[class*=tips], [class*=change], [class*=suspend], [class*=error]') ?? [])]
+                    .map(e => e.innerText.trim()).filter(Boolean);
+                return {buttons: [...new Set(b)].slice(0, 8), tips: [...new Set(tips)].slice(0, 5)}; }""")
+            say(f"The Place Bet button is not on the slip. Slip shows: buttons {foot['buttons']}, notes {foot['tips']}")
             ok = False
 
         if not (place or to_confirm):
