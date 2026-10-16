@@ -53,7 +53,7 @@ NEAR = {"any": False}
 BETSLIP_CHECK = {"at": 0.0}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
-PRED_MIN = int(os.environ.get("PRED_MIN", "70"))   # superseded 2026-10-16 by the combined score (COMBINED_MIN); kept for reference
+PRED_MIN = int(os.environ.get("PRED_MIN", "70"))   # pre-match chance (%) an outcome needs (the user: 70 with live agreement, 2026-10-16; was 80)
 
 sys.path.insert(0, str(HERE))
 import markets_model  # noqa: E402
@@ -274,7 +274,7 @@ def window(g):
 # The user, 2026-10-16: the whole-game under (market 18) is back, but only when 3+ goals would be needed to lose.
 WHOLE_UNDER_CUSHION = int(os.environ.get("WHOLE_UNDER_CUSHION", "3"))
 # ...and for those, a lower pre-match bar: the user, 2026-10-16 ("if live agrees and pre-game is above 60").
-WHOLE_UNDER_PRED_MIN = int(os.environ.get("WHOLE_UNDER_PRED_MIN", "60"))   # superseded by the combined score
+WHOLE_UNDER_PRED_MIN = int(os.environ.get("WHOLE_UNDER_PRED_MIN", "60"))
 COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
 COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
@@ -375,8 +375,9 @@ def matches(snap, preds, staked):
             if str(mid) == "18" and need < WHOLE_UNDER_CUSHION:
                 continue                  # whole-game unders need three goals to lose (the user, 2026-10-16)
             pc = chance(g["event"], p["model"], o)
-            if pc is None or pc * 100 < PRE_FLOOR:
-                continue                  # even a perfect live score could not lift it to COMBINED_MIN
+            bar = WHOLE_UNDER_PRED_MIN if str(mid) == "18" else PRED_MIN   # whole-game unders reach here only with 3+ to lose
+            if pc is None or pc * 100 < bar:
+                continue
             by_side = markets_model.cushion_by_side(r[0], halves, now)
             danger = [sd for sd, n in zip(("home", "away"), by_side) if n <= markets_model.MAX_EXTRA]
             if not danger:
@@ -396,11 +397,6 @@ def matches(snap, preds, staked):
 
 # ---- the live check (Sportradar's live match stats, just before staking) --------------------
 LIVE_CHECK = os.environ.get("LIVE_CHECK", "1") == "1"
-# The user, 2026-10-16: one combined score, the live analysis weighted 65% and the pre-game analysis 35%.
-# A bet is staked at COMBINED_MIN or more (the hard vetoes and no-live-stats still stop it outright).
-LIVE_WEIGHT = float(os.environ.get("LIVE_WEIGHT", "0.65"))
-COMBINED_MIN = float(os.environ.get("COMBINED_MIN", "70"))
-PRE_FLOOR = max(0.0, (COMBINED_MIN - 100 * LIVE_WEIGHT) / (1 - LIVE_WEIGHT))   # below this, nothing can pass
 LIVE_RECENT_SOT = int(os.environ.get("LIVE_RECENT_SOT", "2"))     # danger side's shots on target, last 10'
 LIVE_DA_PCT = int(os.environ.get("LIVE_DA_PCT", "70"))            # danger side's dangerous-attack share
 
@@ -451,9 +447,15 @@ def flashscore(games):
 
 
 def live_block(stats, danger):
-    """Hard vetoes: no live stats, the danger side (whose goals lose the bet) has a man advantage, LIVE_RECENT_SOT+
-    shots on target in the last 10', or LIVE_DA_PCT%+ of the dangerous attacks. Anything else is weighed by
-    live_score()."""
+    """Why the live game does not back the bet, or None. The danger side is the team whose goals lose it;
+    the other side is the one the bet relies on.
+
+    Vetoes: the danger side has a man advantage, LIVE_RECENT_SOT+ shots on target in the last 10', or
+    LIVE_DA_PCT%+ of the dangerous attacks. Agreement (the user, 2026-10-16: the live game must match the
+    pre-game analysis and the score): with one danger side, the side the bet relies on must be at least
+    level with it on shots on target and on dangerous attacks (possession when a league has no attack
+    stats); with both sides dangerous, the game must be quiet (no side with 60%+ of the attacks, at most
+    one shot on target between them in the last 10')."""
     if not stats:
         return "no live stats for this game"
     idx = {"home": 0, "away": 1}
@@ -465,52 +467,26 @@ def live_block(stats, danger):
             if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
                 return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
         elif stats["sot"][i] >= FS_DOMINANT_SOT and stats["sot"][i] >= 2 * stats["sot"][o]:
+            # No timeline and no reading from 10 minutes ago: judge the whole match instead.
             return f"{d} {stats['sot'][i]} shots on target to {stats['sot'][o]} (no recent-minutes data)"
         if stats.get("da_pct") and stats["da_pct"][i] >= LIVE_DA_PCT:
             return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
-    return None
-
-
-def _quiet(n):
-    return 1.0 if n == 0 else 0.5 if n == 1 else 0.0
-
-
-def live_score(stats, danger):
-    """How strongly the live game backs the bet, 0-100.
-    One danger side: the protecting side's share of shots on target (40%) and of dangerous attacks, or possession
-    without attack stats (30%), and the danger side's quiet last 10' (30%: 0 shots on target = full, 1 = half).
-    Both sides dangerous (whole-game unders): a quiet last 10' at both ends (50%), no side dominating (30%: largest
-    attack share 50% or less = full, 70%+ = none), and a low-event match (20%: 4 or fewer shots on target = full,
-    12+ = none). With no recent-minutes data the recent part counts half."""
-    idx = {"home": 0, "away": 1}
     share = stats.get("da_pct") or stats.get("possession")
-    recent = (stats.get("recent") or {}).get("sot")
+    share_name = "dangerous attacks" if stats.get("da_pct") else "possession"
     if len(danger) == 1:
         i = idx[danger[0]]
         o = 1 - i
-        tot = stats["sot"][0] + stats["sot"][1]
-        sot_share = stats["sot"][o] / tot if tot else 0.5
-        att = share[o] / (share[o] + share[i]) if share and (share[o] + share[i]) else 0.5
-        rec = _quiet(recent[i]) if recent else 0.5
-        return round(100 * (0.4 * sot_share + 0.3 * att + 0.3 * rec))
-    rec = _quiet(recent[0] + recent[1]) if recent else 0.5
-    top = max(share) if share else 50
-    balance = 1.0 if top <= 50 else 0.0 if top >= 70 else (70 - top) / 20
-    events = sum(stats["sot"])
-    low = 1.0 if events <= 4 else 0.0 if events >= 12 else (12 - events) / 8
-    return round(100 * (0.5 * rec + 0.3 * balance + 0.2 * low))
-
-
-def verdict(stats, c):
-    """(ok, live score, combined, reason)."""
-    veto = live_block(stats, c["danger"])
-    if veto:
-        return False, None, None, veto
-    ls = live_score(stats, c["danger"])
-    comb = round(LIVE_WEIGHT * ls + (1 - LIVE_WEIGHT) * c["pre_match"], 1)
-    if comb < COMBINED_MIN:
-        return False, ls, comb, f"combined {comb} < {COMBINED_MIN:g} (live {ls}, pre-match {c['pre_match']}%)"
-    return True, ls, comb, None
+        mine = "away" if danger[0] == "home" else "home"
+        if stats["sot"][o] < stats["sot"][i]:
+            return f"live does not back it: {mine} {stats['sot'][o]} shots on target to {danger[0]}'s {stats['sot'][i]}"
+        if share and share[o] < share[i]:
+            return f"live does not back it: {mine} {share[o]}% of {share_name} to {danger[0]}'s {share[i]}%"
+    elif len(danger) == 2:
+        if share and max(share) >= 60:
+            return f"live does not back it: one side has {max(share)}% of {share_name}"
+        if stats.get("recent") and sum(stats["recent"]["sot"]) > 1:
+            return f"live does not back it: {sum(stats['recent']['sot'])} shots on target in the last 10'"
+    return None
 
 
 def live_check(group):
@@ -529,14 +505,14 @@ def live_check(group):
         remember(ev, minutes.get(ev), st)
     for c in SHADOWS:
         c["live"] = stats.get(c["event"])
-        _, c["live_score"], c["combined"], c["live_block"] = verdict(c["live"], c)
+        c["live_block"] = live_block(c["live"], c["danger"])
     kept = []
     for g in group:
         st = stats.get(g["event"])
         for c in g["alts"]:
-            ok, ls, comb, why = verdict(st, c)
-            if ok:
-                kept.append({**g, "team": c["name"], "pick": {**c, "live": st, "live_score": ls, "combined": comb}})
+            why = live_block(st, c["danger"])
+            if not why:
+                kept.append({**g, "team": c["name"], "pick": {**c, "live": st}})
                 break
             log(f"live check: {g['home']} v {g['away']} {g['score']} {g['minute']}' — {c['name']} @ {c['price']:.2f} not staked: {why}")
     return kept
@@ -685,8 +661,7 @@ def stake(group, tickets):
     for g in group:
         odds *= g["pick"]["price"]
     desc = "; ".join(f"{g['minute']}' {g['home']} {g['score']} {g['away']} → {g['pick']['name']} @ {g['pick']['price']:.2f}"
-                     f" ({g['pick']['cushion']} goals to lose, {g['pick']['pre_match']}% pre-match, live {g['pick'].get('live_score')},"
-                     f" combined {g['pick'].get('combined')})" for g in group)
+                     f" ({g['pick']['cushion']} goals to lose, {g['pick']['pre_match']}% pre-match)" for g in group)
     code = container("book_live.py", *legs, timeout=120)
     # The cushion was counted from the score at scan time. A goal since then can leave a leg one goal
     # from losing, so re-read every leg's score through the booked code and stake only if none moved.
