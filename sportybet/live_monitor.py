@@ -273,6 +273,8 @@ def window(g):
 # - handicaps only on the pre-match favourite (European and Asian, any period; no handicap draw).
 # The user, 2026-10-16: the whole-game under (market 18) is back, but only when 3+ goals would be needed to lose.
 WHOLE_UNDER_CUSHION = int(os.environ.get("WHOLE_UNDER_CUSHION", "3"))
+# ...and for those, a lower pre-match bar: the user, 2026-10-16 ("if live agrees and pre-game is above 60").
+WHOLE_UNDER_PRED_MIN = int(os.environ.get("WHOLE_UNDER_PRED_MIN", "60"))
 COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
 COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
@@ -373,7 +375,8 @@ def matches(snap, preds, staked):
             if str(mid) == "18" and need < WHOLE_UNDER_CUSHION:
                 continue                  # whole-game unders need three goals to lose (the user, 2026-10-16)
             pc = chance(g["event"], p["model"], o)
-            if pc is None or pc * 100 < PRED_MIN:
+            bar = WHOLE_UNDER_PRED_MIN if str(mid) == "18" else PRED_MIN   # whole-game unders reach here only with 3+ to lose
+            if pc is None or pc * 100 < bar:
                 continue
             by_side = markets_model.cushion_by_side(r[0], halves, now)
             danger = [sd for sd, n in zip(("home", "away"), by_side) if n <= markets_model.MAX_EXTRA]
