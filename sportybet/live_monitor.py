@@ -32,7 +32,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
-STAKE = float(os.environ.get("STAKE", "5"))
+STAKE = float(os.environ.get("STAKE", "40"))  # the user: 40 (2026-10-16; was 5)
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.15"))
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
