@@ -38,7 +38,7 @@ MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.15"))
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
 # recorded, to set the cap from data. Ones within MAX_ODDS are also staked as usual ("within_cap").
 SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.40"))
-MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "75"))          # full-match calls, second half
+MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "70"))          # full-match calls, second half
 MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
 # The user's rule (2026-10-15): no cap on tickets; stop for the day after 5 losing tickets. 0 = no limit.
