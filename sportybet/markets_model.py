@@ -486,7 +486,16 @@ def orders(h, a, cap=60):
     return out
 
 
-def cushion(r, halves, half_now):
+def cushion_by_side(r, halves, half_now):
+    """(home, away): fewest further goals by that side alone that lose the bet (MAX_EXTRA + 1 = never).
+    The side with the small number is the danger side: its goals are what can beat the bet."""
+    out = []
+    for side in ("h", "a"):
+        out.append(cushion(r, halves, half_now, alphabet=side))
+    return tuple(out)
+
+
+def cushion(r, halves, half_now, alphabet="ha"):
     """Fewest further goals (either side, any order) that lose the bet. halves: [(h1, a1), (h2, a2)] so
     far; half_now: 1 or 2, the half the further goals fall in. 0 = losing already."""
     pasts = []
@@ -501,7 +510,7 @@ def cushion(r, halves, half_now):
             return 0
         for k in range(1, worst):
             if any(r(M(past + [(half_now, t) for t in extra])) is False
-                   for extra in itertools.product("ha", repeat=k)):
+                   for extra in itertools.product(alphabet, repeat=k)):
                 worst = k
                 break
     return worst

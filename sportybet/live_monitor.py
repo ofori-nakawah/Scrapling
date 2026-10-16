@@ -228,10 +228,14 @@ COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
 COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
 HANDICAP_IDS = {14, 65, 87, 16, 66, 88, 900035}
+# Team-goal markets (over/under, ranges, exact, excluded) by the side whose goals they count.
+TEAM_GOALS = {"home": {19, 69, 91, 23, 549, 450002, 450005}, "away": {20, 70, 92, 24, 550, 450003, 450006}}
+TEAM_OU = {19, 69, 91, 20, 70, 92}
 
 
-def allowed(o, fav):
-    """None if the market policy allows this outcome, else why not."""
+def allowed(o, fav, h=None, a=None):
+    """None if the market policy allows this outcome, else why not. Team unders (2026-10-16): only on
+    the pre-match underdog's goals, and only while the score agrees (the favourite not behind)."""
     mid, _spec, _oid, _mdesc, odesc, _price = o
     try:
         mid = int(mid)
@@ -246,6 +250,14 @@ def allowed(o, fav):
         side = d.split(" ")[0]
         if not fav or side != fav:
             return "handicap not on the favourite"
+    for side, ids in TEAM_GOALS.items():
+        if mid in ids and not (mid in TEAM_OU and not d.startswith("under")):
+            if not fav or side == fav:
+                return "team under not on the underdog"
+            if h is not None:
+                fg, dg = (h, a) if fav == "home" else (a, h)
+                if fg < dg:
+                    return "underdog ahead: the score does not back the call"
     return None
 
 
@@ -292,7 +304,7 @@ def matches(snap, preds, staked):
         ok = []
         for o in g.get("outcomes") or []:
             mid, spec, oid, mdesc, odesc, price = o
-            if price > SHADOW_MAX or allowed(o, p.get("fav")):
+            if price > SHADOW_MAX or allowed(o, p.get("fav"), h, a):
                 continue
             r = markets_model.rule(mid, spec, odesc, mdesc)
             if not r or r[1] != half:
@@ -303,21 +315,73 @@ def matches(snap, preds, staked):
             pc = chance(g["event"], p["model"], o)
             if pc is None or pc * 100 < PRED_MIN:
                 continue
-            SHADOWS.append({"event": g["event"], "half": half, "minute": g["minute"], "score": g["score"],
-                            "match": f"{g['home']} v {g['away']}", "name": f"{mdesc}: {odesc}", "price": price,
-                            "cushion": need, "pre_match": round(pc * 100), "within_cap": price <= MAX_ODDS,
-                            "leg": f"{g['event']}/{mid}/{spec}/{oid}"})
-            if price > MAX_ODDS:
-                continue
-            ok.append((price, need, pc, o))
-        if ok:
-            price, need, pc, o = max(ok, key=lambda x: (x[0], x[1]))
-            mid, spec, oid, mdesc, odesc, _ = o
+            by_side = markets_model.cushion_by_side(r[0], halves, now)
+            danger = [sd for sd, n in zip(("home", "away"), by_side) if n <= markets_model.MAX_EXTRA]
             name = f"{mdesc}: {odesc}" if mdesc else odesc
-            out.append({**g, "half": half, "team": name,
-                        "pick": {"name": name, "price": price, "cushion": need, "pre_match": round(pc * 100),
-                                 "leg": f"{g['event']}/{mid}/{spec}/{oid}"}})
+            cand = {"name": name, "price": price, "cushion": need, "pre_match": round(pc * 100), "danger": danger,
+                    "leg": f"{g['event']}/{mid}/{spec}/{oid}"}
+            SHADOWS.append({"event": g["event"], "half": half, "minute": g["minute"], "score": g["score"],
+                            "match": f"{g['home']} v {g['away']}", "within_cap": price <= MAX_ODDS, **cand})
+            if price <= MAX_ODDS:
+                ok.append(cand)
+        if ok:
+            ok.sort(key=lambda c: (-c["price"], -c["cushion"]))
+            out.append({**g, "half": half, "team": ok[0]["name"], "pick": ok[0], "alts": ok})
     return out
+
+
+# ---- the live check (Sportradar's live match stats, just before staking) --------------------
+LIVE_CHECK = os.environ.get("LIVE_CHECK", "1") == "1"
+LIVE_RECENT_SOT = int(os.environ.get("LIVE_RECENT_SOT", "2"))     # danger side's shots on target, last 10'
+LIVE_DA_PCT = int(os.environ.get("LIVE_DA_PCT", "70"))            # danger side's dangerous-attack share
+
+
+def live_stats(events, minute):
+    ids = sorted({e for e in events if len(e) < 20})
+    if not ids:
+        return {}
+    try:
+        return json.loads(container("live_stats.py", str(minute), *ids, timeout=120))
+    except Exception as e:  # noqa: BLE001
+        log("live stats failed:", e)
+        return {}
+
+
+def live_block(stats, danger):
+    """Why the live game argues against the bet, or None. The danger side is the team whose goals lose it."""
+    if not stats:
+        return None                       # no live coverage: the pre-match and score rules stand alone
+    idx = {"home": 0, "away": 1}
+    for d in danger:
+        i, o = idx[d], 1 - idx[d]
+        if stats["red"][o] > stats["red"][i]:
+            return f"{d} has a man advantage (red card)"
+        if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
+            return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
+        if stats["da_pct"][i] >= LIVE_DA_PCT:
+            return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
+    return None
+
+
+def live_check(group):
+    """Keep, per game, the best candidate the live stats don't argue against; note every shadow's verdict."""
+    if not LIVE_CHECK:
+        return group
+    stats = live_stats([g["event"] for g in group] + [c["event"] for c in SHADOWS],
+                       max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0]))
+    for c in SHADOWS:
+        c["live"] = stats.get(c["event"])
+        c["live_block"] = live_block(c["live"], c["danger"])
+    kept = []
+    for g in group:
+        st = stats.get(g["event"])
+        for c in g["alts"]:
+            why = live_block(st, c["danger"])
+            if not why:
+                kept.append({**g, "team": c["name"], "pick": {**c, "live": st}})
+                break
+            log(f"live check: {g['home']} v {g['away']} {g['score']} {g['minute']}' — {c['name']} @ {c['price']:.2f} not staked: {why}")
+    return kept
 
 
 # ---- guards ---------------------------------------------------------------------------------
@@ -567,7 +631,7 @@ def once():
               if t.get("state") in ("placed", "unclear", "attempted")
               for k in (t.get("keys") or [f"{ev}|FT" for ev in t["events"]])}
     SHADOWS.clear()
-    group = matches(snap, preds, staked)
+    group = live_check(matches(snap, preds, staked))
     try:
         shadow_record(day)
         shadow_settle(day)
