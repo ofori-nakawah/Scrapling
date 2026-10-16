@@ -25,7 +25,8 @@ bot's own betslip script, without asking. Each game is staked at most once. Refu
 Env: AUTO_STAKE (1 = stake, 0 = alert only), STAKE 5, MAX_ODDS 1.04, MIN_MINUTE 80, MIN_MINUTE_1H 35, MIN_CUSHION 2,
 MAX_LOSSES_PER_DAY 5, MAX_TICKETS_PER_DAY 0, INTERVAL 60, IDLE_INTERVAL 300.
 """
-import datetime as dt, html, json, math, os, subprocess, sys, time
+import datetime as dt, html, json, math, os, subprocess, sys, threading, time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -353,6 +354,12 @@ def allowed(o, fav, h=None, a=None, minute=None):
             return "GG/NG 2+ No needs a known favourite"
         if (a if fav == "home" else h) > 0:
             return "GG/NG 2+ No only while the underdog is on 0"
+    md = (_mdesc or "").lower()
+    if "goals in a row" in md:
+        # The user, 2026-10-16: "X goals in a row" markets only on the underdog's goals (not "Any Team").
+        side = "home" if md.startswith("home") else "away" if md.startswith("away") else None
+        if not fav or side is None or side == fav:
+            return "goals-in-a-row not on the underdog"
     for side, ids in TEAM_GOALS.items():
         if mid in ids and not (mid in TEAM_OU and not d.startswith("under")):
             late = LATE_FAV_TEAM_UNDERS and minute is not None and minute >= LATE_MINUTE
@@ -471,6 +478,41 @@ def live_stats(events, minute):
         return {}
 
 
+FS_DOMINANT_SOT = 4                   # Flashscore with no earlier reading: whole-match shots-on-target check
+_history = {}    # (event, source) -> [(minute, [sot home, sot away])], for recent pressure
+
+
+def remember(event, minute, stats):
+    if stats and minute is not None:
+        _history.setdefault((event, stats.get("source")), []).append((minute, list(stats["sot"])))
+
+
+def recent_from_history(event, minute, stats):
+    """Shots on target since the reading closest to 10 minutes ago (needs one at least 8 minutes old)."""
+    old = [(m, s) for m, s in _history.get((event, stats.get("source")) if stats else None, []) if m <= minute - 8]
+    if not old or not stats:
+        return None
+    _, then = max(old, key=lambda x: x[0])
+    return {"sot": [max(0, stats["sot"][0] - then[0]), max(0, stats["sot"][1] - then[1])], "shots": None}
+
+
+def flashscore(games):
+    """The fallback source for games Sportradar does not cover (the user, 2026-10-16: reintroduced).
+    A game is accepted only when Flashscore shows the same score, so a wrong match cannot pass."""
+    if not games:
+        return {}
+    (OUT / "fs-in.json").write_text(json.dumps([{"event": g["event"], "home": g["home"], "away": g["away"],
+                                                 "score": g["score"]} for g in games]))
+    try:
+        got = json.loads(container("flashscore_stats.py", "/work/out/live/fs-in.json", timeout=300))
+    except Exception as e:  # noqa: BLE001
+        log("flashscore failed:", e)
+        return {}
+    for g in games:
+        log(f"flashscore: {g['home']} v {g['away']} -> " + (got.get(g["event"]) or {}).get("flashscore", "no confident match"))
+    return {k: v for k, v in got.items() if v}
+
+
 def live_block(stats, danger):
     """Why the live game does not back the bet, or None. The danger side is the team whose goals lose it;
     the other side is the one the bet relies on.
@@ -487,8 +529,12 @@ def live_block(stats, danger):
         i, o = idx[d], 1 - idx[d]
         if stats["red"][o] > stats["red"][i]:
             return f"{d} has a man advantage (red card)"
-        if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
-            return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
+        if stats.get("recent"):
+            if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
+                return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
+        elif stats["sot"][i] >= FS_DOMINANT_SOT and stats["sot"][i] >= 2 * stats["sot"][o]:
+            # Flashscore, no reading from 10 minutes ago: judge the whole match instead.
+            return f"{d} {stats['sot'][i]} shots on target to {stats['sot'][o]} (no recent-minutes data)"
         if stats.get("da_pct") and stats["da_pct"][i] >= LIVE_DA_PCT:
             return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
     share, share_name = stats.get("da_pct"), "dangerous attacks"
@@ -503,27 +549,119 @@ def live_block(stats, danger):
     elif len(danger) == 2:
         if share and max(share) >= 60:
             return f"live does not back it: one side has {max(share)}% of {share_name}"
-        if sum(stats["recent"]["sot"]) > 1:
+        if not stats.get("recent") and not share:
+            return "not enough live data to call the game quiet (no recent shots, no attack share)"
+        if stats.get("recent") and sum(stats["recent"]["sot"]) > 1:
             return f"live does not back it: {sum(stats['recent']['sot'])} shots on target in the last 10'"
     return None
 
 
+def livescore(games):
+    """Livescore's live status for these games: {event: {score, minute, red, stats?}} (about 2 s, no browser)."""
+    if not games:
+        return {}
+    (OUT / "ls-in.json").write_text(json.dumps([{"event": g["event"], "home": g["home"], "away": g["away"],
+                                                 "score": g["score"]} for g in games]))
+    try:
+        got = json.loads(container("livescore_stats.py", "/work/out/live/ls-in.json", timeout=60))
+    except Exception as e:  # noqa: BLE001
+        log("livescore failed:", e)
+        return {}
+    return {k: v for k, v in got.items() if v}
+
+
+def status_conflict(g, judge, ls):
+    """Why Livescore's view of the game contradicts SportyBet's score or the live stats' red cards, else None.
+    The user, 2026-10-16: confirm the live status on a second site before staking."""
+    if not ls:
+        return None
+    if ls["score"] != g["score"]:
+        return f"livescore shows {ls['score']}, SportyBet {g['score']}"
+    known = (judge or {}).get("red") or [0, 0]
+    if ls["red"][0] > known[0] or ls["red"][1] > known[1]:
+        return f"livescore shows red cards {ls['red'][0]}-{ls['red'][1]}, the live stats {known[0]}-{known[1]}"
+    return None
+
+
+_fs = {}         # event -> (when, score, Flashscore stats or None)
+_fs_thread = None
+FS_FRESH_S = 150
+
+
+def fs_fresh(g):
+    c = _fs.get(g["event"])
+    return c[2] if c and time.time() - c[0] < FS_FRESH_S and c[1] == g["score"] else None
+
+
+def fs_read(games):
+    """Read Flashscore for these games and keep the readings (and their shots history)."""
+    got = flashscore(games)
+    for g in games:
+        st = got.get(g["event"])
+        if st:
+            st["recent"] = recent_from_history(g["event"], g["minute"], st)
+            remember(g["event"], g["minute"], st)
+        _fs[g["event"]] = (time.time(), g["score"], st)
+
+
+def fs_prefetch(snap, preds):
+    """Flashscore is slow (a browser run), so read it in the background, ahead of time, for analysed games that
+    Sportradar cannot cover and that are near a window: the reading is ready when the game qualifies."""
+    global _fs_thread
+    if _fs_thread and _fs_thread.is_alive():
+        return
+    due = [g for g in snap["games"] if len(g["event"]) >= 20 and (preds.get(g["event"]) or {}).get("model")
+           and not is_srl(g) and g["minute"] is not None and time.time() - _fs.get(g["event"], (0,))[0] > 90
+           and ((g["period"] == "H1" and MIN_MINUTE_1H and g["minute"] >= MIN_MINUTE_1H - 3)
+                or (g["period"] == "H2" and g["minute"] >= MIN_MINUTE - 3))]
+    if due:
+        _fs_thread = threading.Thread(target=fs_read, args=(due,), daemon=True)
+        _fs_thread.start()
+
+
 def live_check(group):
-    """Keep, per game, the best candidate the live stats don't argue against; note every shadow's verdict."""
+    """Keep, per game, the best candidate the live stats don't argue against; note every shadow's verdict.
+
+    The judge is Sportradar (the only source with shots in the last 10'); Flashscore when Sportradar has nothing
+    (read ahead by fs_prefetch); Livescore's statistics last. Livescore also confirms the live status, in
+    parallel with Sportradar: a different score or a red card the stats don't show stops the stake."""
     # The user, 2026-10-16: never stake a game without the live analysis. This check always runs; there is no
     # setting that skips it, and a game without live stats is never staked.
-    stats = live_stats([g["event"] for g in group] + [c["event"] for c in SHADOWS],
-                       max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0]))
+    events = [g["event"] for g in group] + [c["event"] for c in SHADOWS]
+    minute = max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0])
+    with ThreadPoolExecutor(2) as ex:
+        f_sr, f_ls = ex.submit(live_stats, events, minute), ex.submit(livescore, group)
+        stats, ls = f_sr.result(), f_ls.result()
     for c in SHADOWS:
         c["live"] = stats.get(c["event"])
         c["live_block"] = live_block(c["live"], c["danger"])
+    need = [g for g in group if not stats.get(g["event"]) and not fs_fresh(g)]
+    if need:
+        if _fs_thread and _fs_thread.is_alive():
+            _fs_thread.join(timeout=120)
+        fs_read([g for g in need if not fs_fresh(g)])
     kept = []
     for g in group:
-        st = stats.get(g["event"])
+        ev, l = g["event"], ls.get(g["event"])
+        judge = stats.get(ev)
+        if judge:
+            judge["source"] = "sportradar"
+        else:
+            judge = fs_fresh(g) or (l or {}).get("stats")
+            if judge and judge.get("source") == "livescore":
+                judge["recent"] = recent_from_history(ev, g["minute"], judge)
+                remember(ev, g["minute"], judge)
+        log(f"live sources: {g['home']} v {g['away']} {g['score']}: judge "
+            + (f"{judge['source']} sot {judge['sot'][0]}-{judge['sot'][1]}" if judge else "none")
+            + (f" · livescore {l['score']} {l.get('minute')} red {l['red'][0]}-{l['red'][1]}" if l else " · livescore: not listed"))
+        conflict = status_conflict(g, judge, l)
+        if conflict:
+            log(f"live check: {g['home']} v {g['away']} {g['score']} {g['minute']}' not staked: {conflict}")
+            continue
         for c in g["alts"]:
-            why = live_block(st, c["danger"])
+            why = live_block(judge, c["danger"])
             if not why:
-                kept.append({**g, "team": c["name"], "pick": {**c, "live": st}})
+                kept.append({**g, "team": c["name"], "pick": {**c, "live": judge}})
                 break
             log(f"live check: {g['home']} v {g['away']} {g['score']} {g['minute']}' — {c['name']} @ {c['price']:.2f} not staked: {why}")
     return kept
@@ -1022,6 +1160,7 @@ def once():
               if t.get("state") in ("placed", "unclear", "attempted", "not_placed_verified")
               for k in (t.get("keys") or [f"{ev}|FT" for ev in t["events"]])}
     SHADOWS.clear()
+    fs_prefetch(snap, preds)
     group = live_check(matches(snap, preds, staked))
     try:
         shadow_record(day)

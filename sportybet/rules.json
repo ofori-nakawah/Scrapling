@@ -34,6 +34,6 @@
   "late_whole_game_under_goals_to_lose": 3,
   "late_favourite_team_unders": false,
   "lanes": true,
-  "lane_start_ghs": 200,
+  "lane_start_ghs": 250,
   "lane_split_ghs": 500
 }
