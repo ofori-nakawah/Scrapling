@@ -67,7 +67,7 @@ RULES = {
     "auto_stake": ("AUTO_STAKE", bool), "stake_ghs": ("STAKE", float), "max_price": ("MAX_ODDS", float),
     "first_half_from_minute": ("MIN_MINUTE_1H", int), "full_match_from_minute": ("MIN_MINUTE", int),
     "goals_to_lose": ("MIN_CUSHION", int), "whole_game_under_goals_to_lose": ("WHOLE_UNDER_CUSHION", int),
-    "pre_match_min_pct": ("PRED_MIN", int), "live_check": ("LIVE_CHECK", bool),
+    "pre_match_min_pct": ("PRED_MIN", int),
     "live_block_recent_shots_on_target": ("LIVE_RECENT_SOT", int), "live_block_attack_share_pct": ("LIVE_DA_PCT", int),
     "max_open_slips": ("MAX_OPEN", int), "max_losses_per_day": ("MAX_LOSSES", int), "max_slips_per_day": ("MAX_TICKETS", int),
     "batch_wait_minutes": ("HOLD_MINUTES", float), "price_rise_allowed": ("PRICE_RISE", float),
@@ -114,9 +114,8 @@ def load_rules():
 
 def rules_summary():
     return (f"GHS {STAKE:g} · 1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · {MIN_CUSHION}+ goals to lose "
-            f"({WHOLE_UNDER_CUSHION}+ for whole-game unders, {LATE_WHOLE_UNDER_CUSHION}+ from {LATE_MINUTE}'; favourite's team "
-            f"unders from {LATE_MINUTE}') · {PRED_MIN}% pre-match · live check "
-            f"{'on' if LIVE_CHECK else 'OFF'} · price ≤ {MAX_ODDS} · max {MAX_OPEN} open · stop after {MAX_LOSSES} losses/day")
+            f"({WHOLE_UNDER_CUSHION}+ for whole-game unders) · {PRED_MIN}% pre-match · live analysis required"
+            f" · price ≤ {MAX_ODDS} · max {MAX_OPEN} open · stop after {MAX_LOSSES} losses/day")
 
 
 def log(*a):
@@ -429,7 +428,6 @@ def matches(snap, preds, staked):
 
 
 # ---- the live check (Sportradar's live match stats, just before staking) --------------------
-LIVE_CHECK = True
 LIVE_RECENT_SOT = 2                   # danger side's shots on target, last 10'
 LIVE_DA_PCT = 70                      # danger side's dangerous-attack share
 
@@ -484,8 +482,8 @@ def live_block(stats, danger):
 
 def live_check(group):
     """Keep, per game, the best candidate the live stats don't argue against; note every shadow's verdict."""
-    if not LIVE_CHECK:
-        return group
+    # The user, 2026-10-16: never stake a game without the live analysis. This check always runs; there is no
+    # setting that skips it, and a game without live stats is never staked.
     stats = live_stats([g["event"] for g in group] + [c["event"] for c in SHADOWS],
                        max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0]))
     for c in SHADOWS:
