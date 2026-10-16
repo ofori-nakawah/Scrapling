@@ -16,11 +16,22 @@
   "max_slips_per_day": 0,
   "batch_wait_minutes": 1.5,
   "price_rise_allowed": 0.03,
-  "shadow_log_max_price": 1.40,
+  "shadow_log_max_price": 1.4,
   "check_every_s_near_window": 15,
   "check_every_s": 60,
   "check_every_s_no_games": 300,
   "refresh_analysis_hours": 3,
   "warm_betslip": true,
-  "telegram": ["morning", "matched", "staked", "won", "lost", "halt", "balance"]
+  "telegram": [
+    "morning",
+    "matched",
+    "staked",
+    "won",
+    "lost",
+    "halt",
+    "balance"
+  ],
+  "late_from_minute": 80,
+  "late_whole_game_under_goals_to_lose": 2,
+  "late_favourite_team_unders": true
 }

@@ -73,7 +73,9 @@ RULES = {
     "batch_wait_minutes": ("HOLD_MINUTES", float), "price_rise_allowed": ("PRICE_RISE", float),
     "shadow_log_max_price": ("SHADOW_MAX", float), "check_every_s_near_window": ("FAST_INTERVAL", int),
     "check_every_s": ("INTERVAL", int), "check_every_s_no_games": ("IDLE", int),
-    "refresh_analysis_hours": ("REFRESH_HOURS", float), "warm_betslip": ("WARM_BETSLIP", bool), "telegram": ("NOTIFY", set),
+    "refresh_analysis_hours": ("REFRESH_HOURS", float),
+    "late_from_minute": ("LATE_MINUTE", int), "late_whole_game_under_goals_to_lose": ("LATE_WHOLE_UNDER_CUSHION", int),
+    "late_favourite_team_unders": ("LATE_FAV_TEAM_UNDERS", bool), "warm_betslip": ("WARM_BETSLIP", bool), "telegram": ("NOTIFY", set),
 }
 _rules_seen = {"mtime": None, "bad": False}
 
@@ -112,7 +114,8 @@ def load_rules():
 
 def rules_summary():
     return (f"GHS {STAKE:g} · 1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · {MIN_CUSHION}+ goals to lose "
-            f"({WHOLE_UNDER_CUSHION}+ for whole-game unders) · {PRED_MIN}% pre-match · live check "
+            f"({WHOLE_UNDER_CUSHION}+ for whole-game unders, {LATE_WHOLE_UNDER_CUSHION}+ from {LATE_MINUTE}'; favourite's team "
+            f"unders from {LATE_MINUTE}') · {PRED_MIN}% pre-match · live check "
             f"{'on' if LIVE_CHECK else 'OFF'} · price ≤ {MAX_ODDS} · max {MAX_OPEN} open · stop after {MAX_LOSSES} losses/day")
 
 
@@ -298,6 +301,11 @@ def window(g):
 # - handicaps only on the pre-match favourite (European and Asian, any period; no handicap draw).
 # The user, 2026-10-16: the whole-game under (market 18) is back, but only when 3+ goals would be needed to lose.
 WHOLE_UNDER_CUSHION = 3
+# Additions from LATE_MINUTE (the user, 2026-10-16), on top of the rules above: team unders on the favourite too,
+# and whole-game unders with LATE_WHOLE_UNDER_CUSHION goals to lose.
+LATE_MINUTE = 80
+LATE_WHOLE_UNDER_CUSHION = 2
+LATE_FAV_TEAM_UNDERS = True
 # ...and for those, a lower pre-match bar: the user, 2026-10-16 ("if live agrees and pre-game is above 60").
 COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
@@ -308,7 +316,7 @@ TEAM_GOALS = {"home": {19, 69, 91, 23, 549, 450002, 450005}, "away": {20, 70, 92
 TEAM_OU = {19, 69, 91, 20, 70, 92}
 
 
-def allowed(o, fav, h=None, a=None):
+def allowed(o, fav, h=None, a=None, minute=None):
     """None if the market policy allows this outcome, else why not. Team unders (2026-10-16): only on
     the pre-match underdog's goals, and only while the score agrees (the favourite not behind)."""
     mid, _spec, _oid, _mdesc, odesc, _price = o
@@ -336,7 +344,8 @@ def allowed(o, fav, h=None, a=None):
             return "GG/NG 2+ No only while the underdog is on 0"
     for side, ids in TEAM_GOALS.items():
         if mid in ids and not (mid in TEAM_OU and not d.startswith("under")):
-            if not fav or side == fav:
+            late = LATE_FAV_TEAM_UNDERS and minute is not None and minute >= LATE_MINUTE
+            if not fav or (side == fav and not late):
                 return "team under not on the underdog"
             if h is not None:
                 fg, dg = (h, a) if fav == "home" else (a, h)
@@ -388,7 +397,7 @@ def matches(snap, preds, staked):
         ok = []
         for o in g.get("outcomes") or []:
             mid, spec, oid, mdesc, odesc, price = o
-            if price > SHADOW_MAX or allowed(o, p.get("fav"), h, a):
+            if price > SHADOW_MAX or allowed(o, p.get("fav"), h, a, g["minute"] if half == "FT" else None):
                 continue
             r = markets_model.rule(mid, spec, odesc, mdesc)
             if not r or r[1] != half:
@@ -396,7 +405,8 @@ def matches(snap, preds, staked):
             need = markets_model.cushion(r[0], halves, now)
             if need < MIN_CUSHION:
                 continue
-            if str(mid) == "18" and need < WHOLE_UNDER_CUSHION:
+            whole_need = LATE_WHOLE_UNDER_CUSHION if g["minute"] >= LATE_MINUTE else WHOLE_UNDER_CUSHION
+            if str(mid) == "18" and need < whole_need:
                 continue                  # whole-game unders need three goals to lose (the user, 2026-10-16)
             pc = chance(g["event"], p["model"], o)
             if pc is None or pc * 100 < PRED_MIN:
