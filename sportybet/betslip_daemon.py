@@ -274,13 +274,20 @@ class Betslip:
         page.click(CONFIRM)
 
         def verdict():
-            t = page.inner_text("body")
-            if re.search(r"Submission Successful", t, re.I):
-                return "ok"
-            tip = page.evaluate("""() => [...document.querySelectorAll('.m-error-tips, [class*=toast], [class*=dialog]')]
-                .map(e => e.offsetParent && e.innerText.trim()).find(Boolean) || null""")
-            return f"fail:{tip[:200]}" if tip else None
+            # One read of the page (2026-10-16: two separate reads raced the success dialog, which then counted as
+            # an error tip). "Submission Successful" anywhere wins.
+            return page.evaluate("""() => {
+                if (/Submission Successful/i.test(document.body.innerText)) return 'ok';
+                const tip = [...document.querySelectorAll('.m-error-tips, [class*=toast], [class*=dialog]')]
+                    .map(e => e.offsetParent && e.innerText.trim()).find(Boolean) || null;
+                if (tip && /Submission Successful/i.test(tip)) return 'ok';
+                return tip ? 'fail:' + tip.slice(0, 200) : null;
+            }""")
         v = wait_for(page, verdict, 15_000)
+        if v and v.startswith("fail:"):
+            page.wait_for_timeout(1000)          # a success dialog can still be drawing: look once more
+            if verdict() == "ok":
+                v = "ok"
         if v == "ok":
             say(f"PLACED  GHS {stake:.2f} on {code} at {totals['totalOdds']}"
                 + (f" — potential win GHS {totals['potentialWin']}" if totals["potentialWin"] else ""))

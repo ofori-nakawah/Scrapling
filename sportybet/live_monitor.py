@@ -639,11 +639,68 @@ def interrupted_check():
     for d in (today() - dt.timedelta(days=1), today()):
         for t in read(tickets_file(d), []):
             if t.get("state") == "attempted":
-                HALT.write_text(f"{t['at']} {t['code']}: placement was interrupted; result unknown")
-                telegram(f"⚠️ Ticket {t['code']}: the placement was interrupted, result unknown. Auto-staking is "
-                         f"halted. Check Bet History, then delete {HALT} to resume.", "halt")
-                log(f"halted: {t['code']} was left mid-placement")
+                log(f"{t['code']} was left mid-placement: checking Bet History")
+                state = resolve_from_history(t)
+                t["state"] = state
+                rows = read(tickets_file(d), [])
+                for x in rows:
+                    if x.get("code") == t["code"]:
+                        x.update(t)
+                tickets_file(d).write_text(json.dumps(rows, indent=1))
+                if state == "unclear":
+                    HALT.write_text(f"{t['at']} {t['code']}: placement was interrupted; Bet History unreadable")
+                    telegram(f"⚠️ Ticket {t['code']}: the placement was interrupted and Bet History could not be read. "
+                             f"Auto-staking is halted. Check Bet History, then delete {HALT} to resume.", "halt")
+                else:
+                    telegram(f"ℹ️ Ticket {t['code']}: an interrupted placement was checked in Bet History: {state}.", "halt")
     STAKING.unlink(missing_ok=True)
+
+
+def bet_history_find(legs, stake_ghs, since_ts):
+    """The SportyBet order matching these legs and this stake, placed at or after since_ts (unix s), from Bet History
+    (open and settled bets, via the bot's signed-in session). Returns the order (dict), None if absent, or raises
+    when Bet History can't be read."""
+    import buddy_tools as bt
+    want = set()
+    for leg in legs:
+        ev, mid, spec, oid = leg.split("/", 3)
+        want.add((ev, str(mid), spec or "", str(oid)))
+    for settled in (0, 1):
+        d = bt.account_get(f"orders/order/v2/realbetlist?isSettled={settled}&pageSize=20&pageNo=1")
+        items = d.get("entityList") if isinstance(d, dict) else d
+        for o in items or []:
+            if (o.get("createTime") or 0) / 1000 < since_ts - 60:
+                continue
+            got = {(x.get("eventId"), str(x.get("marketId")), x.get("specifier") or "", str(x.get("outcomeId")))
+                   for x in o.get("selections") or []}
+            try:
+                same_stake = abs(float(o.get("totalStake")) - float(stake_ghs)) < 0.01
+            except (TypeError, ValueError):
+                same_stake = False
+            if got == want and same_stake:
+                return o
+    return None
+
+
+def resolve_from_history(t):
+    """Settle an unclear or interrupted placement from Bet History (the user, 2026-10-16: check it yourself and
+    update). Found -> placed. Not found after ~90 s -> not placed, verified; the game is still never re-staked.
+    Bet History unreadable -> unclear (the caller halts)."""
+    since = dt.datetime.fromisoformat(t["at"]).timestamp()
+    legs = [g["pick"]["leg"] for g in t.get("group", [])] or t.get("legs", [])
+    for wait in (5, 15, 25, 45):
+        time.sleep(wait)
+        try:
+            o = bet_history_find(legs, t["stake"], since)
+        except Exception as e:  # noqa: BLE001
+            log(f"{t['code']}: Bet History unreadable ({e})")
+            return "unclear"
+        if o:
+            t["order"] = o.get("shortId")
+            log(f"{t['code']}: found in Bet History as order {o.get('shortId')}: placed")
+            return "placed"
+    log(f"{t['code']}: not in Bet History after ~90 s: not placed")
+    return "not_placed_verified"
 
 
 def stake(group, tickets):
@@ -674,7 +731,7 @@ def stake(group, tickets):
         log(f"{code}: not staked, price moved since the scan: " + ", ".join(rose))
         return None
     max_total = round(odds + PRICE_RISE, 2)
-    t = {"code": code, "stake": STAKE, "odds": round(odds, 2), "events": [g["event"] for g in group], "keys": [f"{g['event']}|{g['half']}" for g in group],
+    t = {"code": code, "stake": STAKE, "odds": round(odds, 2), "events": [g["event"] for g in group], "legs": legs, "keys": [f"{g['event']}|{g['half']}" for g in group],
          "games": desc, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "state": "attempted"}
     tickets.append(t)
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))   # recorded before any click
@@ -711,10 +768,20 @@ def stake(group, tickets):
         t["why"] = out.strip().splitlines()[-1][:200]
         log("not placed:", t["why"])
     else:
-        t["state"] = "unclear"
-        HALT.write_text(f"{t['at']} {code}: placement result unclear (stage exit {rc})")
-        telegram(f"⚠️ Ticket {code}: placement result UNCLEAR. Auto-staking is halted. Check Bet History, "
-                 f"then delete {HALT} to resume.\n{desc}", "halt")
+        # Not a clean placed / nothing-placed: Bet History decides, never a second click.
+        state = resolve_from_history(t)
+        t["state"] = state
+        if state == "placed":
+            telegram(f"💰 Staked GHS {STAKE:.2f} on {code} (order {t.get('order')}, confirmed in Bet History after an "
+                     f"unclear page; total {t['odds']:.2f})\n{desc}", "staked")
+        elif state == "not_placed_verified":
+            t["why"] = "unclear page, not in Bet History after ~90 s"
+            telegram(f"ℹ️ Ticket {code}: the page was unclear and Bet History shows no such bet, so it was not placed. "
+                     f"Staking continues; this game is not staked again.\n{desc}", "halt")
+        else:
+            HALT.write_text(f"{t['at']} {code}: placement result unclear and Bet History unreadable (exit {rc})")
+            telegram(f"⚠️ Ticket {code}: placement result UNCLEAR and Bet History could not be read. Auto-staking "
+                     f"is halted. Check Bet History, then delete {HALT} to resume.\n{desc}", "halt")
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))
     STAKING.unlink(missing_ok=True)
     log(f"{code}: {t['state']}")
@@ -841,7 +908,7 @@ def once():
     # Staked game+half pairs: a game can be bet once in the first half and once at the end.
     # Tickets from before halves were tracked count as full-match ("FT").
     staked = {k for d in (day - dt.timedelta(days=1), day) for t in read(tickets_file(d), [])
-              if t.get("state") in ("placed", "unclear", "attempted")
+              if t.get("state") in ("placed", "unclear", "attempted", "not_placed_verified")
               for k in (t.get("keys") or [f"{ev}|FT" for ev in t["events"]])}
     SHADOWS.clear()
     group = live_check(matches(snap, preds, staked))
