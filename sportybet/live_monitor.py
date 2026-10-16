@@ -271,6 +271,8 @@ def window(g):
 # - unders only on one team's goals: no bet on the two teams' combined total (match / half / rest-of-match
 #   over-under, total-goal ranges, exact and excluded totals, and combos or "X or" markets with a total);
 # - handicaps only on the pre-match favourite (European and Asian, any period; no handicap draw).
+# The user, 2026-10-16: the whole-game under (market 18) is back, but only when 3+ goals would be needed to lose.
+WHOLE_UNDER_CUSHION = int(os.environ.get("WHOLE_UNDER_CUSHION", "3"))
 COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
                       854, 855, 856, 857, 858, 859, 818, 819, 820}
 COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
@@ -289,7 +291,9 @@ def allowed(o, fav, h=None, a=None):
     except (TypeError, ValueError):
         return "unknown market"
     d = (odesc or "").lower()
-    if mid in COMBINED_TOTAL_IDS:
+    if mid == 18 and d.startswith("under"):
+        pass                              # whole-game under: allowed only with WHOLE_UNDER_CUSHION (see matches())
+    elif mid in COMBINED_TOTAL_IDS:
         return "combined-total market"
     if mid in COMBO_IDS and ("over" in d or "under" in d):
         return "combo with a combined total"
@@ -366,6 +370,8 @@ def matches(snap, preds, staked):
             need = markets_model.cushion(r[0], halves, now)
             if need < MIN_CUSHION:
                 continue
+            if str(mid) == "18" and need < WHOLE_UNDER_CUSHION:
+                continue                  # whole-game unders need three goals to lose (the user, 2026-10-16)
             pc = chance(g["event"], p["model"], o)
             if pc is None or pc * 100 < PRED_MIN:
                 continue
