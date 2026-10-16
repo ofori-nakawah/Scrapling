@@ -32,7 +32,7 @@ HERE = Path(__file__).resolve().parent
 OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
-STAKE = float(os.environ.get("STAKE", "40"))  # the user: 40 (2026-10-16; was 5)
+STAKE = float(os.environ.get("STAKE", "100"))  # the user: 100 (2026-10-16; was 5, then 40)
 MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.15"))
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
@@ -43,7 +43,7 @@ MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
 # The user's rule (2026-10-15): no cap on tickets; stop for the day after 5 losing tickets. 0 = no limit.
 MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "0"))
-MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "5"))
+MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "2"))   # the user: 2 (2026-10-16; was 5)
 # At most this many slips open (placed, not yet settled) at once; the user's rule, 2026-10-15. 0 = no limit.
 MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "5"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
