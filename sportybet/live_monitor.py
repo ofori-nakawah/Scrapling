@@ -347,6 +347,40 @@ def live_stats(events, minute):
         return {}
 
 
+FS_DOMINANT_SOT = int(os.environ.get("FS_DOMINANT_SOT", "4"))   # Flashscore with no history: whole-match check
+_history = {}    # event -> [(minute, [sot home, sot away])], from either source, for recent pressure
+
+
+def remember(event, minute, stats):
+    if stats and minute is not None:
+        _history.setdefault(event, []).append((minute, list(stats["sot"])))
+
+
+def recent_from_history(event, minute, stats):
+    """Shots on target since the reading closest to 10 minutes ago (needs one at least 8 minutes old)."""
+    old = [(m, s) for m, s in _history.get(event, []) if m <= minute - 8]
+    if not old or not stats:
+        return None
+    _, then = max(old, key=lambda x: x[0])
+    return {"sot": [max(0, stats["sot"][0] - then[0]), max(0, stats["sot"][1] - then[1])], "shots": None}
+
+
+def flashscore(games):
+    """The fallback source for games Sportradar does not cover (one browser run for all of them)."""
+    if not games:
+        return {}
+    (OUT / "fs-in.json").write_text(json.dumps([{"event": g["event"], "home": g["home"], "away": g["away"],
+                                                 "score": g["score"]} for g in games]))
+    try:
+        got = json.loads(container("flashscore_stats.py", "/work/out/live/fs-in.json", timeout=300))
+    except Exception as e:  # noqa: BLE001
+        log("flashscore failed:", e)
+        return {}
+    for g in games:
+        log(f"flashscore: {g['home']} v {g['away']} -> " + (got.get(g["event"]) or {}).get("flashscore", "no confident match"))
+    return {k: v for k, v in got.items() if v}
+
+
 def live_block(stats, danger):
     """Why the live game argues against the bet, or None. The danger side is the team whose goals lose it."""
     if not stats:
@@ -358,9 +392,13 @@ def live_block(stats, danger):
         i, o = idx[d], 1 - idx[d]
         if stats["red"][o] > stats["red"][i]:
             return f"{d} has a man advantage (red card)"
-        if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
-            return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
-        if stats["da_pct"][i] >= LIVE_DA_PCT:
+        if stats.get("recent"):
+            if stats["recent"]["sot"][i] >= LIVE_RECENT_SOT:
+                return f"{d} {stats['recent']['sot'][i]} shots on target in the last 10'"
+        elif stats["sot"][i] >= FS_DOMINANT_SOT and stats["sot"][i] >= 2 * stats["sot"][o]:
+            # No timeline and no reading from 10 minutes ago: judge the whole match instead.
+            return f"{d} {stats['sot'][i]} shots on target to {stats['sot'][o]} (no recent-minutes data)"
+        if stats.get("da_pct") and stats["da_pct"][i] >= LIVE_DA_PCT:
             return f"{d} {stats['da_pct'][i]}% of dangerous attacks"
     return None
 
@@ -371,6 +409,14 @@ def live_check(group):
         return group
     stats = live_stats([g["event"] for g in group] + [c["event"] for c in SHADOWS],
                        max([g["minute"] for g in group] + [c["minute"] for c in SHADOWS] + [0]))
+    # Sportradar first; Flashscore for games it does not cover (the user, 2026-10-16).
+    stats.update(flashscore([g for g in group if not stats.get(g["event"])]))
+    minutes = {g["event"]: g["minute"] for g in group}
+    minutes.update({c["event"]: c["minute"] for c in SHADOWS})
+    for ev, st in stats.items():
+        if st and st.get("source") == "flashscore":
+            st["recent"] = recent_from_history(ev, minutes.get(ev, 0), st)
+        remember(ev, minutes.get(ev), st)
     for c in SHADOWS:
         c["live"] = stats.get(c["event"])
         c["live_block"] = live_block(c["live"], c["danger"])
