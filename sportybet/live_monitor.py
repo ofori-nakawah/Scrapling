@@ -550,7 +550,7 @@ def pending_siblings(group, snap, preds, staked):
             if abs(s["kickoff"] - k) > SIBLING_KICKOFF_MIN * 60_000:
                 continue
             p = preds.get(s["event"]) or {}
-            if not p.get("model") or f"{s['event']}|{g['half']}" in staked or s["minute"] is None:
+            if not p.get("model") or f"{s['event']}|{g['half']}" in staked or s["minute"] is None or is_srl(s):
                 continue
             near = ((g["half"] == "1H" and s["period"] == "H1" and s["minute"] >= MIN_MINUTE_1H - 5) or
                     (g["half"] == "FT" and s["period"] == "H2" and s["minute"] >= MIN_MINUTE - 5))
@@ -604,9 +604,10 @@ def settle(tickets):
             except Exception:  # noqa: BLE001
                 paid = None
             if paid is not None:
-                t["result"] = "won" if paid > 0 else "lost"
+                # A void slip (SportyBet cancelled it) pays back exactly the stake.
+                t["result"] = ("void" if abs(paid - t["stake"]) < 0.01 else "won") if paid > 0 else "lost"
         if t.get("result"):
-            telegram(f"{'✅' if t['result'] == 'won' else '❌'} Ticket {t['code']} {t['result'].upper()} "
+            telegram(f"{ {'won': '✅', 'void': '↩️'}.get(t['result'], '❌')} Ticket {t['code']} {t['result'].upper()} "
                      f"(GHS {t['stake']:.2f} @ {t['odds']:.2f})", t["result"])
     return tickets
 
@@ -627,6 +628,18 @@ def lanes_settle(day, tickets):
     changed = False
     for t in tickets:
         if not t.get("lane") or not t.get("result") or t.get("lane_done"):
+            continue
+        if t["result"] == "void":
+            lane = L.by_code(t["code"])
+            if lane:                      # stake back: the lane is free again, same amount, no win counted
+                lane["open"] = None
+                lane["history"].append({"code": t["code"], "stake": t["stake"], "won": None, "void": True,
+                                        "payout": t["stake"], "at": int(time.time())})
+                L.save()
+                e = f"Lane {lane['id']}: slip {t['code']} void, {t['stake']:.2f} returned"
+                log(e)
+                telegram(f"🛤 {e}", "won")
+            t["lane_done"] = changed = True
             continue
         won = t["result"] == "won"
         payout = 0.0
