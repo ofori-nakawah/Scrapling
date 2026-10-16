@@ -35,3 +35,10 @@ Scrapling (D4Vinci/Scrapling) plus our own work. Three remotes:
    ```
    The live monitor and the Pexels API use the `scrapling:local` / `scrapling:stealth` images, so rebuild both
    and restart them (`launchctl kickstart -k gui/$(id -u)/com.scrapling.livemonitor`, `docker restart pexels-api`).
+
+## The live monitor's worker container
+
+`live_monitor.py` runs the scripts inside a long-running container, `scrapling-worker` (about 1 s a call
+instead of about 6 s for a fresh `docker run ... uv run`). It is created on demand from `scrapling:local`.
+After rebuilding that image, remove it so the next pass starts it from the new image:
+`docker rm -f scrapling-worker`.

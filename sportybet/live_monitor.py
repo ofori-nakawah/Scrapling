@@ -47,6 +47,9 @@ MAX_LOSSES = int(os.environ.get("MAX_LOSSES_PER_DAY", "2"))   # the user: 2 (202
 # At most this many slips open (placed, not yet settled) at once; the user's rule, 2026-10-15. 0 = no limit.
 MAX_OPEN = int(os.environ.get("MAX_OPEN_SLIPS", "5"))
 INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE_INTERVAL", "300"))
+# While an analysed game is near or inside a window, check more often: prices and scores move fast there.
+FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "30"))
+NEAR = {"any": False}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
 PRED_MIN = int(os.environ.get("PRED_MIN", "80"))   # pre-match chance (%) an outcome needs (the user: 80, 2026-10-15)
@@ -65,8 +68,27 @@ def today():
     return dt.datetime.now(dt.timezone.utc).date()
 
 
+WORKER = "scrapling-worker"
+VENV_PY = "/app/.venv/bin/python"
+
+
+def worker_up():
+    """A long-running container the scripts are exec'd into: ~1.2 s a call instead of ~6 s for a fresh
+    `docker run ... uv run` (uv re-syncs the environment on every start)."""
+    r = subprocess.run(["docker", "inspect", "-f", "{{.State.Running}}", WORKER], capture_output=True, text=True)
+    if r.stdout.strip() == "true":
+        return True
+    subprocess.run(["docker", "rm", "-f", WORKER], capture_output=True)
+    r = subprocess.run(["docker", "run", "-d", "--name", WORKER, "--restart", "unless-stopped", "-v", f"{HERE}:/work",
+                        "--entrypoint", "sleep", "scrapling:local", "infinity"], capture_output=True, text=True)
+    if r.returncode == 0:
+        log("started the scrapling worker container")
+    return r.returncode == 0
+
+
 def container(script, *args, timeout=240):
-    r = subprocess.run(DOCKER + [f"/work/{script}", *args], capture_output=True, text=True, timeout=timeout)
+    cmd = (["docker", "exec", WORKER, VENV_PY] if worker_up() else DOCKER) + [f"/work/{script}", *args]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     line = next((l for l in reversed(r.stdout.splitlines()) if l.strip()), "")
     if r.returncode != 0 or not line:
         raise RuntimeError(f"{script} failed: {(r.stderr or r.stdout)[-300:]}")
@@ -817,6 +839,9 @@ def once():
             stake(group, tickets)
     page(snap, preds, tickets, note)
     HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "done", "live": len(snap["games"])}))
+    NEAR["any"] = any((preds.get(g["event"]) or {}).get("model") and g["minute"] is not None and
+                      ((g["period"] == "H1" and g["minute"] >= ANALYSE_1H) or (g["period"] == "H2" and g["minute"] >= ANALYSE_2H))
+                      for g in snap["games"])
     late = sum(1 for g in snap["games"] if (g["minute"] or 0) >= MIN_MINUTE)
     with_call = sum(1 for g in snap["games"] if (preds.get(g["event"]) or {}).get("picks"))
     log(f"{len(snap['games'])} live, {with_call} with a morning call, {late} at {MIN_MINUTE}'+, {len(group)} matching")
@@ -837,7 +862,7 @@ def main():
             live = 1
         if "--once" in sys.argv:
             return
-        time.sleep(INTERVAL if live else IDLE)
+        time.sleep((FAST_INTERVAL if NEAR["any"] else INTERVAL) if live else IDLE)
 
 
 if __name__ == "__main__":
