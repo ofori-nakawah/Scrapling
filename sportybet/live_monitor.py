@@ -33,13 +33,13 @@ OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = os.environ.get("AUTO_STAKE", "1") == "1"
 STAKE = float(os.environ.get("STAKE", "5"))
-MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.10"))
+MAX_ODDS = float(os.environ.get("MAX_ODDS", "1.15"))
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
 # recorded, to set the cap from data. Ones within MAX_ODDS are also staked as usual ("within_cap").
 SHADOW_MAX = float(os.environ.get("SHADOW_MAX", "1.40"))
-MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "73"))          # full-match calls, second half
-MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "37"))    # first-half calls, first half (0 = off)
+MIN_MINUTE = int(os.environ.get("MIN_MINUTE", "75"))          # full-match calls, second half
+MIN_MINUTE_1H = int(os.environ.get("MIN_MINUTE_1H", "35"))    # first-half calls, first half (0 = off)
 MIN_CUSHION = int(os.environ.get("MIN_CUSHION", "2"))
 # The user's rule (2026-10-15): no cap on tickets; stop for the day after 5 losing tickets. 0 = no limit.
 MAX_TICKETS = int(os.environ.get("MAX_TICKETS_PER_DAY", "0"))
@@ -350,7 +350,9 @@ def live_stats(events, minute):
 def live_block(stats, danger):
     """Why the live game argues against the bet, or None. The danger side is the team whose goals lose it."""
     if not stats:
-        return None                       # no live coverage: the pre-match and score rules stand alone
+        # The user (2026-10-16): stake only when the morning analysis, the live analysis and the score all
+        # agree, so a game without live stats is not staked.
+        return "no live stats for this game"
     idx = {"home": 0, "away": 1}
     for d in danger:
         i, o = idx[d], 1 - idx[d]
