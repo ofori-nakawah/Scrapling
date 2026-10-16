@@ -250,10 +250,13 @@ def allowed(o, fav, h=None, a=None):
         side = d.split(" ")[0]
         if not fav or side != fav:
             return "handicap not on the favourite"
-    if mid == 60000 and d == "no" and h is not None and h > 0 and a > 0:
-        # The user, 2026-10-16: GG/NG 2+ No only while a team is still on 0, so exactly one team has to
-        # score twice to lose it (at 1:1 a goal at each end would do).
-        return "GG/NG 2+ No with both teams already scoring"
+    if mid == 60000 and d == "no" and h is not None:
+        # The user, 2026-10-16: GG/NG 2+ No only while the pre-match underdog is still on 0, so exactly one
+        # team - the weaker one - has to score twice to lose it (at 1:1 a goal at each end would do).
+        if not fav:
+            return "GG/NG 2+ No needs a known favourite"
+        if (a if fav == "home" else h) > 0:
+            return "GG/NG 2+ No only while the underdog is on 0"
     for side, ids in TEAM_GOALS.items():
         if mid in ids and not (mid in TEAM_OU and not d.startswith("under")):
             if not fav or side == fav:
