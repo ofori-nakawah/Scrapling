@@ -433,7 +433,7 @@ def live_check(group):
 
 
 # ---- batching (the user, 2026-10-16: bigger odds per 5 cedis) -------------------------------------
-HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "3"))     # wait at most this long for sibling games
+HOLD_MINUTES = float(os.environ.get("HOLD_MINUTES", "1.5"))   # wait at most this long for sibling games (the user: 1.5)
 SIBLING_KICKOFF_MIN = 5                                        # kicked off within 5 minutes of each other
 _held = {}       # event|half -> when it first qualified while waiting for siblings
 
