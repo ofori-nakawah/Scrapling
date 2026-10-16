@@ -379,6 +379,12 @@ def chance(event, model, o):
     return _probs[key]
 
 
+def is_srl(g):
+    """A Simulated Reality League game (simulated, not a real match)."""
+    names = [(g.get("league") or "").lower()] + [(g.get(k) or "").lower() for k in ("home", "away")]
+    return "simulated reality" in names[0] or any(n.endswith(" srl") or " srl " in n for n in names)
+
+
 SHADOWS = []     # filled by matches(): candidates priced above the cap, for the shadow log
 
 
@@ -394,6 +400,8 @@ def matches(snap, preds, staked):
         half = window(g)
         if not p or not p.get("model") or not half or f"{g['event']}|{half}" in staked:
             continue
+        if is_srl(g):
+            continue                      # the user, 2026-10-16: never stake Simulated Reality League games
         try:
             h, a = map(int, g["score"].split(":"))
         except (AttributeError, ValueError):
@@ -589,6 +597,14 @@ def settle(tickets):
             t["result"] = "lost"
         elif len(ended) == len(legs) and all(l["winning"] == 1 for l in legs):
             t["result"] = "won"
+        if not t.get("result") and t.get("order"):
+            # The share API can lag the real settlement by a long time: Bet History is the truth.
+            try:
+                paid = bet_history_payout(t["order"])
+            except Exception:  # noqa: BLE001
+                paid = None
+            if paid is not None:
+                t["result"] = "won" if paid > 0 else "lost"
         if t.get("result"):
             telegram(f"{'✅' if t['result'] == 'won' else '❌'} Ticket {t['code']} {t['result'].upper()} "
                      f"(GHS {t['stake']:.2f} @ {t['odds']:.2f})", t["result"])
