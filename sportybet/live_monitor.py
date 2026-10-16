@@ -169,6 +169,7 @@ def analyse_missing(snap, preds):
         picks, why = predict_day.calls(r)
         model = markets_model.rates(r["stats"]) if r.get("stats") else None
         store[r["event_id"]] = {"model": {"lh": model[0], "la": model[1]} if model else None,
+                                "fav": predict_day.favourite_side(r, model),
                                 "match": f"{r['home_team']} v {r['away_team']}", "kickoff_utc": "", "home": r["home_team"],
                                 "away": r["away_team"], "picks": picks, "side": None, "team": None,
                                 "why": why or "on-demand (live: no winner calls)", "on_demand": True}
@@ -219,6 +220,35 @@ def window(g):
     return None
 
 
+# The user's market policy (2026-10-16):
+# - unders only on one team's goals: no bet on the two teams' combined total (match / half / rest-of-match
+#   over-under, total-goal ranges, exact and excluded totals, and combos or "X or" markets with a total);
+# - handicaps only on the pre-match favourite (European and Asian, any period; no handicap draw).
+COMBINED_TOTAL_IDS = {18, 68, 90, 900028, 21, 71, 93, 25, 548, 552, 553, 450001, 810001, 450004, 810002,
+                      854, 855, 856, 857, 858, 859, 818, 819, 820}
+COMBO_IDS = {35, 36, 37, 546, 547, 78, 79, 542, 543, 544, 545, 900042, 900043}
+HANDICAP_IDS = {14, 65, 87, 16, 66, 88, 900035}
+
+
+def allowed(o, fav):
+    """None if the market policy allows this outcome, else why not."""
+    mid, _spec, _oid, _mdesc, odesc, _price = o
+    try:
+        mid = int(mid)
+    except (TypeError, ValueError):
+        return "unknown market"
+    d = (odesc or "").lower()
+    if mid in COMBINED_TOTAL_IDS:
+        return "combined-total market"
+    if mid in COMBO_IDS and ("over" in d or "under" in d):
+        return "combo with a combined total"
+    if mid in HANDICAP_IDS:
+        side = d.split(" ")[0]
+        if not fav or side != fav:
+            return "handicap not on the favourite"
+    return None
+
+
 _sims = {}       # event -> simulated matches from its model (built once per process)
 _probs = {}      # (event, market, specifier, outcome) -> pre-match chance
 
@@ -262,7 +292,7 @@ def matches(snap, preds, staked):
         ok = []
         for o in g.get("outcomes") or []:
             mid, spec, oid, mdesc, odesc, price = o
-            if price > SHADOW_MAX:
+            if price > SHADOW_MAX or allowed(o, p.get("fav")):
                 continue
             r = markets_model.rule(mid, spec, odesc, mdesc)
             if not r or r[1] != half:

@@ -44,10 +44,23 @@ def favourite(g, s):
     return side, price, f"favourite @ {price:.2f}, form GD {gd[side]:+.1f} v {gd[other]:+.1f} per game"
 
 
+def favourite_side(g, model):
+    """The pre-match favourite: the shorter 1X2 price when the game was analysed before kick-off,
+    otherwise the side the model expects to score more. None when it can't be told."""
+    h, a = g.get("home"), g.get("away")
+    if g.get("status") == "upcoming" and h and a and h != a:
+        return "home" if h < a else "away"
+    if model and model[0] != model[1]:
+        return "home" if model[0] > model[1] else "away"
+    return None
+
+
 def calls(g):
     s = g.get("stats")
     if not s:
         return [], "no stats"
+    if not s["home"].get("n") or not s["away"].get("n"):
+        return [], "no recent matches for one side"     # e.g. a newly promoted or youth side
     team = {"home": g["home_team"], "away": g["away_team"]}
     out = []
     side, price, why = favourite(g, s)
@@ -95,6 +108,7 @@ def main():
         win = next((p for p in picks if p["kind"] == "win"), None)  # the full-match winner call
         model = markets_model.rates(g["stats"]) if g.get("stats") else None
         out[g["event_id"]] = {"model": {"lh": model[0], "la": model[1]} if model else None,
+                              "fav": favourite_side(g, model),
                               "match": f"{g['home_team']} v {g['away_team']}", "kickoff_utc": g["kickoff_utc"],
                               "home": g["home_team"], "away": g["away_team"], "picks": picks,
                               "side": win["side"] if win else None, "team": win["name"][:-4] if win else None,
