@@ -30,9 +30,16 @@ def status(code):
     d = r.json()
     if d.get("bizCode") != 10000:
         sys.exit(f"status failed: {d.get('bizCode')} {d.get('message')}")
-    return [{"event": ev["eventId"], "status": ev.get("status"), "score": ev.get("setScore"),
-             "winning": ev["markets"][0]["outcomes"][0].get("isWinning")}
-            for ev in d["data"]["outcomes"]]
+    out = []
+    for ev in d["data"]["outcomes"]:
+        o = ev["markets"][0]["outcomes"][0]
+        try:
+            odds = float(o.get("odds"))
+        except (TypeError, ValueError):
+            odds = None
+        out.append({"event": ev["eventId"], "status": ev.get("status"), "score": ev.get("setScore"),
+                    "winning": o.get("isWinning"), "odds": odds, "active": o.get("isActive", 1)})
+    return out
 
 
 if __name__ == "__main__":

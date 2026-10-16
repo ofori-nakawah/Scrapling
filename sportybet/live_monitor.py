@@ -582,6 +582,8 @@ def check_balance_morning():
 # ---- staking --------------------------------------------------------------------------------
 
 STAKING = OUT / "STAKING"     # present while a placement runs; restart_monitor.sh waits for it
+PRICE_RISE = float(os.environ.get("PRICE_RISE", "0.03"))   # how far a price may rise between scan and click
+HEARTBEAT = OUT / "heartbeat"  # touched every pass; watchdog.py alerts when it goes stale
 
 
 def interrupted_check():
@@ -607,12 +609,24 @@ def stake(group, tickets):
     code = container("book_live.py", *legs, timeout=120)
     # The cushion was counted from the score at scan time. A goal since then can leave a leg one goal
     # from losing, so re-read every leg's score through the booked code and stake only if none moved.
-    now = {l["event"]: l["score"] for l in json.loads(container("book_live.py", "--status", code, timeout=120))}
-    moved = [g for g in group if now.get(g["event"]) != g["score"]]
+    legs_now = {l["event"]: l for l in json.loads(container("book_live.py", "--status", code, timeout=120))}
+    moved = [g for g in group if (legs_now.get(g["event"]) or {}).get("score") != g["score"]]
     if moved:
         log(f"{code}: not staked, score changed since the scan: " +
-            ", ".join(f"{g['home']} {g['score']}→{now.get(g['event'])}" for g in moved))
+            ", ".join(f"{g['home']} {g['score']}→{(legs_now.get(g['event']) or {}).get('score')}" for g in moved))
         return None
+    # Price protection (2026-10-16): a price that rose since the bet qualified means the market sees more
+    # danger now, so a leg above the cap, up more than PRICE_RISE, or suspended stops the stake.
+    rose = []
+    for g in group:
+        now_odds = (legs_now.get(g["event"]) or {}).get("odds")
+        active = (legs_now.get(g["event"]) or {}).get("active", 1)
+        if now_odds is None or not active or now_odds > MAX_ODDS or now_odds > g["pick"]["price"] + PRICE_RISE:
+            rose.append(f"{g['home']} {g['pick']['name']} {g['pick']['price']:.2f}→{now_odds if active else 'suspended'}")
+    if rose:
+        log(f"{code}: not staked, price moved since the scan: " + ", ".join(rose))
+        return None
+    max_total = round(odds + PRICE_RISE, 2)
     t = {"code": code, "stake": STAKE, "odds": round(odds, 2), "events": [g["event"] for g in group], "keys": [f"{g['event']}|{g['half']}" for g in group],
          "games": desc, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "state": "attempted"}
     tickets.append(t)
@@ -620,7 +634,8 @@ def stake(group, tickets):
     STAKING.write_text(t["code"])
     log(f"STAKING {code}: {desc}")
     try:
-        r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--place", "--headless"],
+        r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--max-odds", f"{max_total:.2f}",
+                            "--place", "--headless"],
                            cwd=BOT, capture_output=True, text=True, timeout=420)
         out, rc = r.stdout + r.stderr, r.returncode
     except subprocess.TimeoutExpired as e:
@@ -750,6 +765,7 @@ small{{color:#777}}.note{{padding:8px 12px;background:#f4f4f4;border-radius:8px}
 def once():
     day = today()
     OUT.mkdir(parents=True, exist_ok=True)
+    HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "start"}))
     try:
         ensure_predictions(day)
     except Exception as e:  # noqa: BLE001
@@ -800,6 +816,7 @@ def once():
         else:
             stake(group, tickets)
     page(snap, preds, tickets, note)
+    HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "done", "live": len(snap["games"])}))
     late = sum(1 for g in snap["games"] if (g["minute"] or 0) >= MIN_MINUTE)
     with_call = sum(1 for g in snap["games"] if (preds.get(g["event"]) or {}).get("picks"))
     log(f"{len(snap['games'])} live, {with_call} with a morning call, {late} at {MIN_MINUTE}'+, {len(group)} matching")
