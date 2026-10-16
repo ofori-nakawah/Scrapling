@@ -514,3 +514,27 @@ def cushion(r, halves, half_now, alphabet="ha"):
                 worst = k
                 break
     return worst
+
+
+def late_risk(r, halves, half_now, share_home, lam):
+    """The chance the bet loses from here: further goals arrive as Poisson(lam) (the game's expected goals for the
+    minutes left), each the home side's with probability share_home. Sequences up to MAX_EXTRA more goals are
+    scored exactly; the order of the goals so far is taken at its worst. Lower is safer: a bet that the protecting
+    side's goals also help (a favourite's handicap) scores lower than one they don't (the underdog's under)."""
+    pasts = []
+    for o1 in orders(*halves[0]):
+        for o2 in (orders(*halves[1]) if len(halves) > 1 else {()}):
+            pasts.append([(1, t) for t in o1] + [(2, t) for t in o2])
+    worst = 0.0
+    for past in pasts:
+        risk = 0.0
+        for k in range(0, MAX_EXTRA + 1):
+            pk = math.exp(-lam) * lam ** k / math.factorial(k)
+            for extra in itertools.product("ha", repeat=k):
+                w = 1.0
+                for t in extra:
+                    w *= share_home if t == "h" else 1 - share_home
+                if r(M(past + [(half_now, t) for t in extra])) is False:
+                    risk += pk * w
+        worst = max(worst, risk)
+    return worst

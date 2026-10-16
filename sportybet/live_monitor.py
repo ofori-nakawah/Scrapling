@@ -415,14 +415,22 @@ def matches(snap, preds, staked):
             if not danger:
                 danger = ["home", "away"]     # no side can lose it alone: goals from both together are the danger
             name = f"{mdesc}: {odesc}" if mdesc else odesc
+            # Late-goal risk: goals still to come at the game's expected rate for the minutes left, shared between the
+            # sides as the analysis expected (precedence, the user 2026-10-16).
+            lh, la = p["model"]["lh"], p["model"]["la"]
+            left = max(5, (47 if half == "1H" else 95) - g["minute"])
+            risk = markets_model.late_risk(r[0], halves, now, lh / (lh + la), (lh + la) * left / 90)
             cand = {"name": name, "price": price, "cushion": need, "pre_match": round(pc * 100), "danger": danger,
-                    "leg": f"{g['event']}/{mid}/{spec}/{oid}"}
+                    "risk": round(100 * risk, 2), "leg": f"{g['event']}/{mid}/{spec}/{oid}"}
             SHADOWS.append({"event": g["event"], "half": half, "minute": g["minute"], "score": g["score"],
                             "match": f"{g['home']} v {g['away']}", "within_cap": price <= MAX_ODDS, **cand})
             if price <= MAX_ODDS:
                 ok.append(cand)
         if ok:
-            ok.sort(key=lambda c: (-c["price"], -c["cushion"]))
+            # Precedence (the user, 2026-10-16): most goals to lose, then the lowest late-goal risk (where the protecting
+            # side's goals help, e.g. a favourite's handicap over the underdog's under), then the pre-match chance,
+            # and the price last.
+            ok.sort(key=lambda c: (-c["cushion"], c["risk"], -c["pre_match"], -c["price"]))
             out.append({**g, "half": half, "team": ok[0]["name"], "pick": ok[0], "alts": ok})
     return out
 
