@@ -33,7 +33,11 @@ RULES_FILE = HERE / "rules.json"
 OUT = HERE / "out" / "live"
 BOT = Path("/Users/apple/Projects/claudesportybot")
 AUTO_STAKE = True
-STAKE = 100.0
+STAKE = 100.0                          # the stake when lanes are off
+# Lanes (the user, 2026-10-16): every GHS 100 is a lane rolling its winnings; at 200 it splits in two; lanes.py.
+LANES_ON = True
+LANE_START = 100.0
+LANE_SPLIT = 200.0
 MAX_ODDS = 1.15
 # Shadow log (the user, 2026-10-16): every bet passing every rule except the price cap, from 1.01 to
 # SHADOW_MAX, is booked once (a free single code) at the first minute it qualifies and its real result
@@ -58,6 +62,11 @@ PRED_MIN = 80                         # pre-match chance (%) every bet needs
 
 sys.path.insert(0, str(HERE))
 import markets_model  # noqa: E402
+from lanes import Lanes  # noqa: E402
+
+
+def lanes():
+    return Lanes(OUT / "lanes.json", LANE_START, LANE_SPLIT)
 
 sys.path.insert(0, str(BOT / "scripts"))
 
@@ -74,6 +83,7 @@ RULES = {
     "shadow_log_max_price": ("SHADOW_MAX", float), "check_every_s_near_window": ("FAST_INTERVAL", int),
     "check_every_s": ("INTERVAL", int), "check_every_s_no_games": ("IDLE", int),
     "refresh_analysis_hours": ("REFRESH_HOURS", float),
+    "lanes": ("LANES_ON", bool), "lane_start_ghs": ("LANE_START", float), "lane_split_ghs": ("LANE_SPLIT", float),
     "late_from_minute": ("LATE_MINUTE", int), "late_whole_game_under_goals_to_lose": ("LATE_WHOLE_UNDER_CUSHION", int),
     "late_favourite_team_unders": ("LATE_FAV_TEAM_UNDERS", bool), "warm_betslip": ("WARM_BETSLIP", bool), "telegram": ("NOTIFY", set),
 }
@@ -113,7 +123,7 @@ def load_rules():
 
 
 def rules_summary():
-    return (f"GHS {STAKE:g} · 1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · {MIN_CUSHION}+ goals to lose "
+    return ((f"lanes of {LANE_START:g} (split at {LANE_SPLIT:g})" if LANES_ON else f"GHS {STAKE:g}") + f" · 1H {MIN_MINUTE_1H}'+ / FT {MIN_MINUTE}'+ · {MIN_CUSHION}+ goals to lose "
             f"({WHOLE_UNDER_CUSHION}+ for whole-game unders) · {PRED_MIN}% pre-match · live analysis required"
             f" · price ≤ {MAX_ODDS} · max {MAX_OPEN} open · stop after {MAX_LOSSES} losses/day")
 
@@ -227,7 +237,8 @@ def ensure_predictions(day):
         return
     called = [v for v in merged.values() if v.get("picks")]
     telegram(f"📋 {day}: {len(called)} games analysed.\n"
-             f"{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: {rules_summary()}", "morning")
+             f"{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: {rules_summary()}"
+             + (f"\n🛤 {lanes().summary()}" if LANES_ON else ""), "morning")
     check_balance_morning()
 
 
@@ -583,13 +594,51 @@ def settle(tickets):
     return tickets
 
 
-def refusal(tickets, open_now=0):
+def bet_history_payout(order_id):
+    """What a settled order paid (GHS), from Bet History; None if it can't be found."""
+    import buddy_tools as bt
+    d = bt.account_get("orders/order/v2/realbetlist?isSettled=1&pageSize=50&pageNo=1")
+    for o in (d.get("entityList") if isinstance(d, dict) else d) or []:
+        if str(o.get("shortId")) == str(order_id):
+            return float(o.get("totalWinnings") or 0)
+    return None
+
+
+def lanes_settle(day, tickets):
+    """Lanes follow their slips' results: the payout from Bet History (stake x odds if it can't be read)."""
+    L = lanes()
+    changed = False
+    for t in tickets:
+        if not t.get("lane") or not t.get("result") or t.get("lane_done"):
+            continue
+        won = t["result"] == "won"
+        payout = 0.0
+        if won:
+            try:
+                payout = bet_history_payout(t.get("order")) if t.get("order") else None
+            except Exception:  # noqa: BLE001
+                payout = None
+            payout = payout if payout else round(t["stake"] * t["odds"], 2)
+        for e in L.settle(t["code"], won, payout):
+            log(e)
+            telegram(f"🛤 {e}", "won" if won else "lost")
+        t["lane_done"] = changed = True
+    if changed:
+        tickets_file(day).write_text(json.dumps(tickets, indent=1))
+    import risk
+    for e in L.replenish(risk.balance_now()):
+        log(e)
+        telegram(f"🛤 {e}", "won")
+
+
+def refusal(tickets, open_now=0, amount=None):
+    amount = amount or STAKE
     import risk
     cfg = risk.load_config()
     if HALT.exists():
         return f"halted: {HALT.read_text().strip()} (check Bet History, then delete {HALT})"
-    if not cfg["stake_min"] <= STAKE <= cfg["stake_max"]:
-        return f"stake GHS {STAKE} outside config/risk.json {cfg['stake_min']}-{cfg['stake_max']}"
+    if not cfg["stake_min"] <= amount <= cfg["stake_max"]:
+        return f"stake GHS {amount} outside config/risk.json {cfg['stake_min']}-{cfg['stake_max']}"
     placed = [t for t in tickets if t.get("state") == "placed"]
     if MAX_TICKETS and len(placed) >= MAX_TICKETS:
         return f"{len(placed)} tickets already today (MAX_TICKETS_PER_DAY {MAX_TICKETS})"
@@ -601,8 +650,8 @@ def refusal(tickets, open_now=0):
     bal = risk.balance_now()
     if bal is None:
         return "balance unreadable (session expired? run `npm run login` in claudesportybot)"
-    if bal < STAKE:
-        return f"balance GHS {bal:.2f} below the GHS {STAKE:.2f} stake"
+    if bal < amount:
+        return f"balance GHS {bal:.2f} below the GHS {amount:.2f} stake"
     return None
 
 
@@ -711,7 +760,8 @@ def open_bet_events():
             for x in o.get("selections") or []}
 
 
-def stake(group, tickets):
+def stake(group, tickets, amount=None, lane_id=None):
+    amt = round(amount or STAKE, 2)        # the lane's amount; STAKE only when lanes are off
     # The user, 2026-10-16: a game must never be staked twice. Before every stake, games already on an open bet
     # in Bet History are dropped; if Bet History can't be read, nothing is staked this pass.
     try:
@@ -752,7 +802,7 @@ def stake(group, tickets):
         log(f"{code}: not staked, price moved since the scan: " + ", ".join(rose))
         return None
     max_total = round(odds + PRICE_RISE, 2)
-    t = {"code": code, "stake": STAKE, "odds": round(odds, 2), "events": [g["event"] for g in group], "legs": legs, "keys": [f"{g['event']}|{g['half']}" for g in group],
+    t = {"code": code, "stake": amt, "lane": lane_id, "odds": round(odds, 2), "events": [g["event"] for g in group], "legs": legs, "keys": [f"{g['event']}|{g['half']}" for g in group],
          "games": desc, "at": dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds"), "state": "attempted"}
     tickets.append(t)
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))   # recorded before any click
@@ -761,7 +811,7 @@ def stake(group, tickets):
     out, rc, via = "", 4, "warm betslip"
     if betslip_ready():
         try:
-            r = subprocess.run(["docker", "exec", WORKER, VENV_PY, "/work/betslip.py", code, "--stake", f"{STAKE:g}",
+            r = subprocess.run(["docker", "exec", WORKER, VENV_PY, "/work/betslip.py", code, "--stake", f"{amt:.2f}",
                                 "--max-odds", f"{max_total:.2f}", "--place"], capture_output=True, text=True, timeout=360)
             out, rc = r.stdout + r.stderr, r.returncode
         except subprocess.TimeoutExpired as e:
@@ -769,7 +819,7 @@ def stake(group, tickets):
     if rc == 4:     # the daemon never got the request: nothing was placed, so the bot's script may try
         via = "stage-bet.js"
         try:
-            r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--max-odds", f"{max_total:.2f}",
+            r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{amt:.2f}", "--max-odds", f"{max_total:.2f}",
                                 "--place", "--headless"],
                                cwd=BOT, capture_output=True, text=True, timeout=420,
                                # Half the bet script's human-pace pauses (still 0.75-2 s): a dry run measured
@@ -783,7 +833,12 @@ def stake(group, tickets):
         f.write(f"\n==== {t['at']} {code} exit {rc}\n{out}\n")
     if rc == 0:
         t["state"] = "placed"
-        telegram(f"💰 Staked GHS {STAKE:.2f} on {code} (total {t['odds']:.2f}, returns ~GHS {STAKE * t['odds']:.2f})\n{desc}", "staked")
+        try:
+            o = bet_history_find(t["legs"], amt, dt.datetime.fromisoformat(t["at"]).timestamp())
+            t["order"] = o.get("shortId") if o else None
+        except Exception:  # noqa: BLE001
+            pass
+        telegram(f"💰 Staked GHS {amt:.2f} on {code}" + (f" (lane {lane_id})" if lane_id else "") + f" (total {t['odds']:.2f}, returns ~GHS {amt * t['odds']:.2f})\n{desc}", "staked")
     elif "Nothing was placed" in out:
         t["state"] = "not_placed"
         t["why"] = out.strip().splitlines()[-1][:200]
@@ -793,7 +848,7 @@ def stake(group, tickets):
         state = resolve_from_history(t)
         t["state"] = state
         if state == "placed":
-            telegram(f"💰 Staked GHS {STAKE:.2f} on {code} (order {t.get('order')}, confirmed in Bet History after an "
+            telegram(f"💰 Staked GHS {amt:.2f} on {code} (order {t.get('order')}, confirmed in Bet History after an "
                      f"unclear page; total {t['odds']:.2f})\n{desc}", "staked")
         elif state == "not_placed_verified":
             t["why"] = "unclear page, not in Bet History after ~90 s"
@@ -803,6 +858,8 @@ def stake(group, tickets):
             HALT.write_text(f"{t['at']} {code}: placement result unclear and Bet History unreadable (exit {rc})")
             telegram(f"⚠️ Ticket {code}: placement result UNCLEAR and Bet History could not be read. Auto-staking "
                      f"is halted. Check Bet History, then delete {HALT} to resume.\n{desc}", "halt")
+    if lane_id and t["state"] == "placed":
+        lanes().assign(lane_id, code)
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))
     STAKING.unlink(missing_ok=True)
     log(f"{code}: {t['state']}")
@@ -897,7 +954,7 @@ small{{color:#777}}.note{{padding:8px 12px;background:#f4f4f4;border-radius:8px}
 <h2>Live football — {len(snap['games'])} games</h2>
 <p class=note>{'Auto-staking' if AUTO_STAKE else 'Alerts only'}: {rules_summary()} (rules.json)
 {('<br><b>' + e(note) + '</b>') if note else ''}<br><small>Updated {at} · refreshes every 30 s</small></p>
-<h3>Today's tickets</h3><table>{trows}</table>
+<h3>Lanes</h3><p>{e(lanes().summary()) if LANES_ON else 'off'}</p><h3>Today's tickets</h3><table>{trows}</table>
 <h3>Live</h3><table>{''.join(rows)}</table>""")
 
 
@@ -926,6 +983,9 @@ def once():
     tickets = settle(read(tickets_file(day), []))
     tickets_file(day).write_text(json.dumps(tickets, indent=1))
     open_now = sum(1 for t in earlier + tickets if t.get("state") == "placed" and not t.get("result"))
+    if LANES_ON:
+        lanes_settle(yday, earlier)
+        lanes_settle(day, tickets)
     # Staked game+half pairs: a game can be bet once in the first half and once at the end.
     # Tickets from before halves were tracked count as full-match ("FT").
     staked = {k for d in (day - dt.timedelta(days=1), day) for t in read(tickets_file(d), [])
@@ -943,7 +1003,11 @@ def once():
         group = []                        # re-checked next pass with any siblings that qualify meanwhile
     if group:
         names = ", ".join(f"{g['pick']['name']} ({g['home']} {g['score']} {g['away']}, {g['minute']}')" for g in group)
-        why = refusal(tickets, open_now) if AUTO_STAKE else "alerts only (AUTO_STAKE=0)"
+        lane = lanes().free() if LANES_ON else None
+        amount = lane["amount"] if lane else STAKE
+        why = refusal(tickets, open_now, amount) if AUTO_STAKE else "alerts only (AUTO_STAKE=0)"
+        if LANES_ON and not lane and not why:
+            why = "every lane has a slip open"
         if why and why.startswith("balance GHS"):
             balance_alert(f"{why} — matched {names}")
         if why:
@@ -956,7 +1020,7 @@ def once():
                 telegram(f"🔎 Matched: {names}\nNot staked: {why}", "matched")
                 key.write_text(json.dumps(seen + new))
         else:
-            stake(group, tickets)
+            stake(group, tickets, amount, lane["id"] if lane else None)
     page(snap, preds, tickets, note)
     HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "done", "live": len(snap["games"])}))
     if WARM_BETSLIP and time.time() - BETSLIP_CHECK["at"] > 600:      # keep the warm betslip up between stakes
