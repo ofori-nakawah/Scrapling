@@ -42,3 +42,12 @@ Scrapling (D4Vinci/Scrapling) plus our own work. Three remotes:
 instead of about 6 s for a fresh `docker run ... uv run`). It is created on demand from `scrapling:local`.
 After rebuilding that image, remove it so the next pass starts it from the new image:
 `docker rm -f scrapling-worker`.
+
+## The warm betslip
+
+`sportybet/betslip_daemon.py` keeps one signed-in Scrapling browser open in `scrapling-worker` and places
+stakes through SportyBet's real betslip (a port of claudesportybot's `stage-bet.js`, with all its checks):
+about 10 s a stake instead of 20-30 s. The worker mounts `claudesportybot/.chrome-profile` read-only for
+the saved session, which pulld's keep-alive renews hourly. `betslip.py CODE --stake N --to-confirm` tests
+everything up to SportyBet's confirm panel without confirming. If the daemon is down, the monitor falls
+back to `stage-bet.js`.

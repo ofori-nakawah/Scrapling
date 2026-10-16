@@ -50,6 +50,7 @@ INTERVAL, IDLE = int(os.environ.get("INTERVAL", "60")), int(os.environ.get("IDLE
 # While an analysed game is near or inside a window, check more often: prices and scores move fast there.
 FAST_INTERVAL = int(os.environ.get("FAST_INTERVAL", "30"))
 NEAR = {"any": False}
+BETSLIP_CHECK = {"at": 0.0}
 DOCKER = ["docker", "run", "--rm", "-v", f"{HERE}:/work", "--entrypoint", "uv", "scrapling:local", "run", "python"]
 HALT = OUT / "HALT"
 PRED_MIN = int(os.environ.get("PRED_MIN", "80"))   # pre-match chance (%) an outcome needs (the user: 80, 2026-10-15)
@@ -69,6 +70,9 @@ def today():
 
 
 WORKER = "scrapling-worker"
+# Stake through the warm Scrapling betslip (betslip_daemon.py, ~10 s) instead of stage-bet.js (~20-30 s): the user,
+# 2026-10-16. stage-bet.js stays the fallback when the betslip daemon is not reachable.
+WARM_BETSLIP = os.environ.get("WARM_BETSLIP", "1") == "1"
 VENV_PY = "/app/.venv/bin/python"
 
 
@@ -79,11 +83,32 @@ def worker_up():
     if r.stdout.strip() == "true":
         return True
     subprocess.run(["docker", "rm", "-f", WORKER], capture_output=True)
+    # The bot's saved SportyBet session is mounted read-only for the warm betslip (betslip_daemon.py).
     r = subprocess.run(["docker", "run", "-d", "--name", WORKER, "--restart", "unless-stopped", "-v", f"{HERE}:/work",
+                        "-v", f"{BOT / '.chrome-profile'}:/session:ro",
                         "--entrypoint", "sleep", "scrapling:local", "infinity"], capture_output=True, text=True)
     if r.returncode == 0:
         log("started the scrapling worker container")
     return r.returncode == 0
+
+
+def betslip_ready():
+    """The warm Scrapling betslip (betslip_daemon.py) inside the worker: running, or started now (it signs in from
+    the bot's saved session). False if it can't be brought up: stakes then go through stage-bet.js."""
+    if not WARM_BETSLIP or not worker_up():
+        return False
+    health = ["docker", "exec", WORKER, VENV_PY, "/work/betslip.py", "--health"]
+    if subprocess.run(health, capture_output=True).returncode == 0:
+        return True
+    subprocess.run(["docker", "exec", "-d", WORKER, "sh", "-c",
+                    f"{VENV_PY} /work/betslip_daemon.py >> /work/out/live/betslip.log 2>&1"], capture_output=True)
+    for _ in range(20):
+        time.sleep(2)
+        if subprocess.run(health, capture_output=True).returncode == 0:
+            log("started the warm betslip")
+            return True
+    log("warm betslip did not start; stakes use stage-bet.js")
+    return False
 
 
 def container(script, *args, timeout=240):
@@ -655,16 +680,27 @@ def stake(group, tickets):
     tickets_file(today()).write_text(json.dumps(tickets, indent=1))   # recorded before any click
     STAKING.write_text(t["code"])
     log(f"STAKING {code}: {desc}")
-    try:
-        r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--max-odds", f"{max_total:.2f}",
-                            "--place", "--headless"],
-                           cwd=BOT, capture_output=True, text=True, timeout=420,
-                           # Half the bet script's human-pace pauses (still 0.75-2 s): a dry run measured
-                           # 26.7 s at pace 1 and 19.0 s at 0.5 (2026-10-16). Prices move while it runs.
-                           env={**os.environ, "SB_PACE": os.environ.get("SB_PACE", "0.5")})
-        out, rc = r.stdout + r.stderr, r.returncode
-    except subprocess.TimeoutExpired as e:
-        out, rc = str(e), 3
+    out, rc, via = "", 4, "warm betslip"
+    if betslip_ready():
+        try:
+            r = subprocess.run(["docker", "exec", WORKER, VENV_PY, "/work/betslip.py", code, "--stake", f"{STAKE:g}",
+                                "--max-odds", f"{max_total:.2f}", "--place"], capture_output=True, text=True, timeout=360)
+            out, rc = r.stdout + r.stderr, r.returncode
+        except subprocess.TimeoutExpired as e:
+            out, rc = str(e), 3
+    if rc == 4:     # the daemon never got the request: nothing was placed, so the bot's script may try
+        via = "stage-bet.js"
+        try:
+            r = subprocess.run(["npm", "run", "-s", "stage", "--", code, "--stake", f"{STAKE:g}", "--max-odds", f"{max_total:.2f}",
+                                "--place", "--headless"],
+                               cwd=BOT, capture_output=True, text=True, timeout=420,
+                               # Half the bet script's human-pace pauses (still 0.75-2 s): a dry run measured
+                               # 26.7 s at pace 1 and 19.0 s at 0.5 (2026-10-16). Prices move while it runs.
+                               env={**os.environ, "SB_PACE": os.environ.get("SB_PACE", "0.5")})
+            out, rc = r.stdout + r.stderr, r.returncode
+        except subprocess.TimeoutExpired as e:
+            out, rc = str(e), 3
+    t["via"] = via
     with open(OUT / "stage.log", "a") as f:
         f.write(f"\n==== {t['at']} {code} exit {rc}\n{out}\n")
     if rc == 0:
@@ -842,6 +878,9 @@ def once():
             stake(group, tickets)
     page(snap, preds, tickets, note)
     HEARTBEAT.write_text(json.dumps({"at": int(time.time()), "stage": "done", "live": len(snap["games"])}))
+    if WARM_BETSLIP and time.time() - BETSLIP_CHECK["at"] > 600:      # keep the warm betslip up between stakes
+        BETSLIP_CHECK["at"] = time.time()
+        betslip_ready()
     NEAR["any"] = any((preds.get(g["event"]) or {}).get("model") and g["minute"] is not None and
                       ((g["period"] == "H1" and g["minute"] >= ANALYSE_1H) or (g["period"] == "H2" and g["minute"] >= ANALYSE_2H))
                       for g in snap["games"])
